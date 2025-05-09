@@ -3,88 +3,99 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:blev/ble.dart';           // exports Peripheral & L2CapChannel
+import 'package:blev/ble_central.dart';  // exports BleCentral
 
-/// Your 128-bit UUID for the audio WAV characteristic:
-const String audioCharUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
+/// L2CAP PSM for the Jarvis device’s audio WAV stream.
+const int audioPSM = 0x0040;
 
-/// Buffers a full WAV file from the device, firing [onData] on every chunk.
+/// Buffers a full WAV file over an L2CAP channel (PSM 0x0040), firing
+/// [onData] on every chunk for UI updates, and [onDone] when complete.
 class AudioStreamService {
-  final BluetoothDevice device;
+  /// The BLE central (created via `await BleCentral.create()`).
+  final BleCentral ble;
 
-  /// Called on each chunk so the UI can rebuild and show progress.
+  /// The peripheral identifier, e.g. the `.id.id` you got from `scanForPeripherals`.
+  final String peripheralId;
+
+  /// Called on each incoming chunk so the UI can rebuild.
   final VoidCallback? onData;
 
-  StreamSubscription<List<int>>? _audioSub;
+  /// Called once the full WAV file has been received.
+  final VoidCallback? onDone;
 
-  /// Accumulates header + data bytes.
+  Peripheral?       _peripheral;
+  L2CapChannel?     _channel;
+  StreamSubscription<Uint8List>? _sub;
+
+  /// Raw bytes of header + data.
   final List<int> audioBuffer = [];
 
-  /// 44 + data-chunk-size (once parsed).
+  /// 44 bytes WAV header + data length (parsed once we have ≥44 bytes).
   int? expectedLength;
 
-  AudioStreamService(this.device, {this.onData});
+  AudioStreamService({
+    required this.ble,
+    required this.peripheralId,
+    this.onData,
+    this.onDone,
+  });
 
+  /// Connects, opens the L2CAP channel, and starts listening.
   Future<void> init() async {
-    // 1) Connect (ignore if already connected).
-    try {
-      await device.connect(autoConnect: false);
-    } catch (_) {}
+    // 1) connect to the peripheral
+    _peripheral = await ble.connectToPeripheral(peripheralId);
 
-    // 2) Discover & subscribe.
-    final svcs = await device.discoverServices();
-    bool found = false;
+    // 2) open the L2CAP channel
+    _channel = await _peripheral!.openL2CapChannel(psm: audioPSM);
 
-    for (var svc in svcs) {
-      for (var chr in svc.characteristics) {
-        final u = chr.uuid.toString().toLowerCase();
-        if (u == audioCharUuid &&
-            (chr.properties.notify || chr.properties.indicate)) {
-          // enable notifications/indications
-          await chr.setNotifyValue(true);
-          audioBuffer.clear();
-          expectedLength = null;
+    // reset buffer state
+    audioBuffer.clear();
+    expectedLength = null;
 
-          // listen on the new, non-deprecated stream:
-          _audioSub = chr.lastValueStream.listen((data) {
-            _handleChunk(Uint8List.fromList(data));
-          });
-          found = true;
-          break;
-        }
-      }
-      if (found) break;
-    }
-
-    if (!found) {
-      throw Exception('Audio characteristic $audioCharUuid not found');
-    }
+    // 3) subscribe to incoming data
+    _sub = _channel!.stream.listen(_handleChunk);
   }
 
   void _handleChunk(Uint8List chunk) {
     audioBuffer.addAll(chunk);
 
-    // parse WAV header once we have 44 bytes
+    // parse WAV header once we have at least 44 bytes
     if (expectedLength == null && audioBuffer.length >= 44) {
-      final header = Uint8List.fromList(audioBuffer.sublist(40, 44));
-      expectedLength = 44 +
-          ByteData.sublistView(header).getUint32(0, Endian.little);
+      final headerBytes = Uint8List.sublistView(
+        Uint8List.fromList(audioBuffer),
+        40,
+        44,
+      );
+      final dataSize = ByteData.sublistView(headerBytes)
+          .getUint32(0, Endian.little);
+      expectedLength = 44 + dataSize;
     }
 
-    // notify UI of progress
     onData?.call();
 
-    // if full file received, stop listening
-    if (expectedLength != null && audioBuffer.length >= expectedLength!) {
-      _audioSub?.cancel();
-      _audioSub = null;
+    // if full file received, cancel and fire onDone
+    if (expectedLength != null &&
+        audioBuffer.length >= expectedLength!) {
+      _sub?.cancel();
+      _sub = null;
+      onDone?.call();
     }
   }
 
-  void dispose() {
-    _audioSub?.cancel();
-    try {
-      device.disconnect();
-    } catch (_) {}
+  /// Clears the buffer and re-subscribes for the next incoming WAV.
+  void reset() {
+    audioBuffer.clear();
+    expectedLength = null;
+    if (_sub == null && _channel != null) {
+      _sub = _channel!.stream.listen(_handleChunk);
+    }
+  }
+
+  /// Cleans up connections.
+  Future<void> dispose() async {
+    await _sub?.cancel();
+    await _channel?.close();
+    await _peripheral?.disconnect();
   }
 }
