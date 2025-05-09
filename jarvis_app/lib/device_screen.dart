@@ -1,3 +1,5 @@
+// lib/device_screen.dart
+
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -23,25 +25,32 @@ class DeviceScreen extends StatefulWidget {
 
 class _DeviceScreenState extends State<DeviceScreen> {
   late final AudioStreamService _streamSvc;
-  late final AudioPlayerService _playerSvc;
-  late final WhisperService _whisperSvc;
-  late final ChatService _chatSvc;
+  late final AudioPlayerService  _playerSvc;
+  late final WhisperService      _whisperSvc;
+  late final ChatService         _chatSvc;
 
-  bool _connected = false;
-  bool _isSending = false;
-  bool _isPlaying  = false;
+  bool    _connected    = false;
+  bool    _isSending    = false;
+  String  _statusMessage = '';
 
   @override
   void initState() {
     super.initState();
+
     _playerSvc  = AudioPlayerService();
     _whisperSvc = WhisperService(widget.openaiApiKey);
     _chatSvc    = ChatService(widget.openaiApiKey);
 
-    // give us a hook so setState() is called on each chunk
     _streamSvc = AudioStreamService(
       widget.device,
-      onData: () => setState(() {}),
+      onData: () {
+        // update buffering UI
+        setState(() {});
+      },
+      onDone: () {
+        // once full WAV is in, fire off the pipeline
+        _startProcessing();
+      },
     );
 
     _initAll();
@@ -50,7 +59,10 @@ class _DeviceScreenState extends State<DeviceScreen> {
   Future<void> _initAll() async {
     await _playerSvc.init();
     await _streamSvc.init();
-    setState(() => _connected = true);
+    setState(() {
+      _connected     = true;
+      _statusMessage = '✅ Connected – waiting for audio…';
+    });
   }
 
   @override
@@ -60,31 +72,49 @@ class _DeviceScreenState extends State<DeviceScreen> {
     super.dispose();
   }
 
-  Future<void> _onSend() async {
+  /// Called automatically when _streamSvc buffers a full WAV,
+  /// or you can hook this to a button if you still want manual control.
+  Future<void> _startProcessing() async {
     if (_isSending || _streamSvc.audioBuffer.isEmpty) return;
-    setState(() => _isSending = true);
+    setState(() {
+      _isSending     = true;
+      _statusMessage = '📝 Transcribing audio to text…';
+    });
+
+    final wav = Uint8List.fromList(_streamSvc.audioBuffer);
 
     try {
-      final wav = Uint8List.fromList(_streamSvc.audioBuffer);
+      // 1) Whisper
+      final text = await _whisperSvc.transcribe(wav);
+      setState(() {
+        _statusMessage = '🚀 Sending to ChatGPT…';
+      });
 
-      // 1) play the full buffer
-      setState(() => _isPlaying = true);
-      await _playerSvc.playBuffer(wav);
-      setState(() => _isPlaying = false);
-
-      // 2) Whisper → Chat → TTS
-      final text  = await _whisperSvc.transcribe(wav);
+      // 2) Chat
       final reply = await _chatSvc.chat(text);
+      setState(() {
+        _statusMessage = '🗣️ Speaking reply…';
+      });
+
+      // 3) TTS
       await _playerSvc.speak(reply);
 
-      _streamSvc.audioBuffer.clear();
+      setState(() {
+        _statusMessage = '✅ Done – ready for next message';
+      });
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Error: $e')));
+            .showSnackBar(SnackBar(content: Text('Error: $e')));
       }
+      setState(() {
+        _statusMessage = '⚠️ Error: $e';
+      });
     } finally {
-      if (mounted) setState(() => _isSending = false);
+      // clear buffer so the next WAV can be captured
+      _streamSvc.audioBuffer.clear();
+      _isSending = false;
+      setState(() {});
     }
   }
 
@@ -92,10 +122,10 @@ class _DeviceScreenState extends State<DeviceScreen> {
   Widget build(BuildContext ctx) {
     final bufLen = _streamSvc.audioBuffer.length;
     final total  = _streamSvc.expectedLength;
-    final status = !_connected
+    final bufferStatus = !_connected
       ? '⏳ Connecting…'
-      : _isPlaying
-        ? '🔊 Playing buffered audio…'
+      : bufLen == 0
+        ? '⏳ Waiting for data…'
         : total == null
           ? '⏳ Waiting for header…'
           : bufLen < total
@@ -108,12 +138,19 @@ class _DeviceScreenState extends State<DeviceScreen> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            Text(status, style: Theme.of(ctx).textTheme.bodyMedium),
+            Text(bufferStatus,   style: Theme.of(ctx).textTheme.bodyMedium),
+            const SizedBox(height: 8),
+            Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
             const Spacer(),
+            // optional manual retry:
             ElevatedButton.icon(
-              onPressed: (_isSending || !_connected) ? null : _onSend,
-              icon: const Icon(Icons.play_arrow),
-              label: Text(_isSending ? 'Working…' : 'Play & Send to ChatGPT'),
+              onPressed: (_isSending || !_connected || bufLen == 0) 
+                  ? null 
+                  : _startProcessing,
+              icon: const Icon(Icons.send),
+              label: Text(_isSending
+                ? 'Working…'
+                : 'Send to ChatGPT'),
             ),
           ],
         ),

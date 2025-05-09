@@ -5,84 +5,74 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
-/// Your 128-bit UUID for the audio WAV characteristic:
+/// Your 128-bit UUID for the audio-WAV characteristic:
 const String audioCharUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
 
-/// Buffers a full WAV file from the device, firing [onData] on every chunk.
+/// Buffers precisely one WAV file from the device:
+///  • fires `onData` for every chunk (so your UI can update progress)
+///  • fires `onDone` once the full file is in.
+///  • stays subscribed so when you `reset()` it will pick up the next file.
 class AudioStreamService {
   final BluetoothDevice device;
 
-  /// Called on each chunk so the UI can rebuild and show progress.
+  /// Called on every incoming chunk (for UI progress).
   final VoidCallback? onData;
 
-  StreamSubscription<List<int>>? _audioSub;
+  /// Called once, the moment we have the full WAV buffer.
+  final VoidCallback? onDone;
 
-  /// Accumulates header + data bytes.
+  StreamSubscription<List<int>>? _sub;
   final List<int> audioBuffer = [];
-
-  /// 44 + data-chunk-size (once parsed).
   int? expectedLength;
 
-  AudioStreamService(this.device, {this.onData});
+  AudioStreamService(this.device, {this.onData, this.onDone});
 
   Future<void> init() async {
-    // 1) Connect (ignore if already connected).
+    // 1) connect (ignore if already)
     try {
       await device.connect(autoConnect: false);
     } catch (_) {}
 
-    // 2) Discover & subscribe.
+    // 2) discover & hook up
     final svcs = await device.discoverServices();
-    bool found = false;
-
     for (var svc in svcs) {
       for (var chr in svc.characteristics) {
-        final u = chr.uuid.toString().toLowerCase();
-        if (u == audioCharUuid &&
-            (chr.properties.notify || chr.properties.indicate)) {
-          // enable notifications/indications
+        if (chr.uuid.toString().toLowerCase() == audioCharUuid
+            && (chr.properties.notify || chr.properties.indicate)) {
           await chr.setNotifyValue(true);
-          audioBuffer.clear();
-          expectedLength = null;
-
-          // listen on the new, non-deprecated stream:
-          _audioSub = chr.lastValueStream.listen((data) {
-            _handleChunk(Uint8List.fromList(data));
-          });
-          found = true;
-          break;
+          _sub = chr.lastValueStream.listen(_handleChunk);
+          return;
         }
       }
-      if (found) break;
     }
+    throw Exception('Audio characteristic $audioCharUuid not found');
+  }
 
-    if (!found) {
-      throw Exception('Audio characteristic $audioCharUuid not found');
+  void _handleChunk(List<int> bytes) {
+    audioBuffer.addAll(bytes);
+    // parse header once we have 44 bytes
+    if (expectedLength == null && audioBuffer.length >= 44) {
+      final header = Uint8List.fromList(audioBuffer.sublist(40, 44));
+      expectedLength =
+          44 + ByteData.sublistView(header).getUint32(0, Endian.little);
+    }
+    onData?.call();
+
+    // once full file arrived…
+    if (expectedLength != null && audioBuffer.length >= expectedLength!) {
+      onDone?.call();
     }
   }
 
-  void _handleChunk(Uint8List chunk) {
-    audioBuffer.addAll(chunk);
-
-    // parse WAV header once we have 44 bytes
-    if (expectedLength == null && audioBuffer.length >= 44) {
-      final header = Uint8List.fromList(audioBuffer.sublist(40, 44));
-      expectedLength = 44 +
-          ByteData.sublistView(header).getUint32(0, Endian.little);
-    }
-
-    // notify UI of progress
+  /// Clear out the old WAV so the *next* one starts fresh.
+  void reset() {
+    audioBuffer.clear();
+    expectedLength = null;
     onData?.call();
-
-    // if full file received, stop listening
-    if (expectedLength != null && audioBuffer.length >= expectedLength!) {
-      _audioSub?.cancel();
-      _audioSub = null;
-    }
   }
 
   void dispose() {
-    _audioSub?.cancel();
+    _sub?.cancel();
     try {
       device.disconnect();
     } catch (_) {}
