@@ -81,8 +81,8 @@ class _DeviceScreenState extends State<DeviceScreen> {
       _statusMessage = '📝 Transcribing audio to text…';
     });
 
-    final wav = Uint8List.fromList(_streamSvc.audioBuffer);
-
+    //final wav = Uint8List.fromList(_streamSvc.audioBuffer);
+    final wav = _streamSvc.getPcmWav();
     try {
       // 1) Whisper
       final text = await _whisperSvc.transcribe(wav);
