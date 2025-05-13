@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:math';
-import 'dart:convert'; //
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
@@ -34,7 +33,6 @@ class AudioStreamService {
         if (chr.uuid.toString().toLowerCase() == audioCharUuid &&
             (chr.properties.notify || chr.properties.indicate)) {
           await chr.setNotifyValue(true);
-          // ignore: deprecated_member_use
           _sub = chr.value.listen(_handleChunk);
           return;
         }
@@ -46,26 +44,34 @@ class AudioStreamService {
   void _handleChunk(List<int> bytes) {
     debugPrint("Audio buffer length: ${bytes.length}");
     audioBuffer.addAll(bytes);
+    // Parse WAV header length once
     if (expectedLength == null && audioBuffer.length >= 46) {
       final header = Uint8List.fromList(audioBuffer.sublist(42, 46));
       expectedLength =
           46 + ByteData.sublistView(header).getUint32(0, Endian.little);
       debugPrint("📦 Expected total length: $expectedLength bytes");
     }
+
     onData?.call();
-    
+
+    // Process once full buffer received
     if (expectedLength != null && audioBuffer.length >= expectedLength!) {
-      debugPrint("🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
-      final adpcmBody = Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
+      debugPrint(
+          "🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
+      final adpcmBody =
+          Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
       debugPrint("🎵 ADPCM body length: ${adpcmBody.length} bytes");
-      
+
       final pcm = decodeAdpcmToPcm(adpcmBody);
       debugPrint("🎵 Decoded to ${pcm.length} PCM samples");
-      
+
       decodedPcmWav = _buildPcmWav(pcm);
       debugPrint("🎵 Built WAV file: ${decodedPcmWav!.length} bytes");
-      
+
       onDone?.call();
+
+      // Automatically reset buffer state for next message
+      reset();
     }
   }
 
@@ -77,7 +83,7 @@ class AudioStreamService {
     return decodedPcmWav!;
   }
 
-  /// Reset stream
+  /// Reset stream state
   void reset() {
     audioBuffer.clear();
     expectedLength = null;
@@ -92,25 +98,18 @@ class AudioStreamService {
     } catch (_) {}
   }
 
-  /// Decodes IMA ADPCM (256-byte blocks, mono, 16-bit PCM) → List<int16>
+  /// Decodes IMA ADPCM → PCM 16-bit samples
   List<int> decodeAdpcmToPcm(Uint8List input) {
     const blockAlign = 256;
     final samples = <int>[];
-
     int offset = 0;
-    int blockCount = 0;
     while (offset + blockAlign <= input.length) {
       final block = input.sublist(offset, offset + blockAlign);
       final predictor = ByteData.sublistView(block).getInt16(0, Endian.little);
-      final index = block[2] & 0x7F; // Ensure index is in valid range
-      final stepTable = _stepTable;
-      final indexTable = _indexTable;
-
-      int step = stepTable[index];
+      int index = block[2] & 0x7F;
+      int step = _stepTable[index];
       int val = predictor;
       samples.add(val);
-
-      int idx = index;
       int byteIndex = 4;
 
       for (int i = 0; i < (blockAlign - 4) * 2; i++) {
@@ -120,27 +119,18 @@ class AudioStreamService {
         } else {
           nibble = block[byteIndex++] >> 4;
         }
-
         int diff = step >> 3;
         if ((nibble & 1) != 0) diff += step >> 2;
         if ((nibble & 2) != 0) diff += step >> 1;
         if ((nibble & 4) != 0) diff += step;
         if ((nibble & 8) != 0) diff = -diff;
-
-        val += diff;
-        val = val.clamp(-32768, 32767);
+        val = (val + diff).clamp(-32768, 32767);
         samples.add(val);
-
-        idx += indexTable[nibble & 0x0F];
-        idx = idx.clamp(0, 88);
-        step = stepTable[idx];
+        index = (index + _indexTable[nibble & 0x0F]).clamp(0, 88);
+        step = _stepTable[index];
       }
-
       offset += blockAlign;
-      blockCount++;
     }
-
-    debugPrint("🎵 Decoded $blockCount ADPCM blocks");
     return samples;
   }
 
@@ -154,31 +144,39 @@ class AudioStreamService {
     final dataSize = samples.length * 2;
     final fileSize = 44 + dataSize;
 
-    final header = BytesBuilder();
-    header.add(ascii.encode('RIFF'));
-    header.add(_uint32le(fileSize - 8));
-    header.add(ascii.encode('WAVE'));
-    header.add(ascii.encode('fmt '));
-    header.add(_uint32le(16)); // fmt chunk size
-    header.add(_uint16le(1));  // PCM format
-    header.add(_uint16le(numChannels));
-    header.add(_uint32le(sampleRate));
-    header.add(_uint32le(byteRate));
-    header.add(_uint16le(blockAlign));
-    header.add(_uint16le(bitsPerSample));
-    header.add(ascii.encode('data'));
-    header.add(_uint32le(dataSize));
+    final header = BytesBuilder()
+      ..add(utf8.encode('RIFF'))
+      ..add(_uint32le(fileSize - 8))
+      ..add(utf8.encode('WAVE'))
+      ..add(utf8.encode('fmt '))
+      ..add(_uint32le(16))
+      ..add(_uint16le(1))
+      ..add(_uint16le(numChannels))
+      ..add(_uint32le(sampleRate))
+      ..add(_uint32le(byteRate))
+      ..add(_uint16le(blockAlign))
+      ..add(_uint16le(bitsPerSample))
+      ..add(utf8.encode('data'))
+      ..add(_uint32le(dataSize));
 
     final audioBytes = BytesBuilder();
     for (final s in samples) {
       audioBytes.add(_int16le(s));
     }
 
-    return Uint8List.fromList([...header.toBytes(), ...audioBytes.toBytes()]);
+    return Uint8List.fromList([
+      ...header.toBytes(),
+      ...audioBytes.toBytes(),
+    ]);
   }
 
   List<int> _uint16le(int v) => [v & 0xFF, (v >> 8) & 0xFF];
-  List<int> _uint32le(int v) => [v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF];
+  List<int> _uint32le(int v) => [
+        v & 0xFF,
+        (v >> 8) & 0xFF,
+        (v >> 16) & 0xFF,
+        (v >> 24) & 0xFF,
+      ];
   List<int> _int16le(int v) => _uint16le(v & 0xFFFF);
 
   static const List<int> _stepTable = [
