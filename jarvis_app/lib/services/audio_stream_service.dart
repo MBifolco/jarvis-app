@@ -50,13 +50,21 @@ class AudioStreamService {
       final header = Uint8List.fromList(audioBuffer.sublist(42, 46));
       expectedLength =
           46 + ByteData.sublistView(header).getUint32(0, Endian.little);
+      debugPrint("📦 Expected total length: $expectedLength bytes");
     }
     onData?.call();
     
     if (expectedLength != null && audioBuffer.length >= expectedLength!) {
+      debugPrint("🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
       final adpcmBody = Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
+      debugPrint("🎵 ADPCM body length: ${adpcmBody.length} bytes");
+      
       final pcm = decodeAdpcmToPcm(adpcmBody);
+      debugPrint("🎵 Decoded to ${pcm.length} PCM samples");
+      
       decodedPcmWav = _buildPcmWav(pcm);
+      debugPrint("🎵 Built WAV file: ${decodedPcmWav!.length} bytes");
+      
       onDone?.call();
     }
   }
@@ -90,10 +98,11 @@ class AudioStreamService {
     final samples = <int>[];
 
     int offset = 0;
+    int blockCount = 0;
     while (offset + blockAlign <= input.length) {
       final block = input.sublist(offset, offset + blockAlign);
       final predictor = ByteData.sublistView(block).getInt16(0, Endian.little);
-      final index = block[2];
+      final index = block[2] & 0x7F; // Ensure index is in valid range
       final stepTable = _stepTable;
       final indexTable = _indexTable;
 
@@ -104,7 +113,7 @@ class AudioStreamService {
       int idx = index;
       int byteIndex = 4;
 
-      for (int i = 0; i <  (blockAlign - 4) * 2; i++) {
+      for (int i = 0; i < (blockAlign - 4) * 2; i++) {
         int nibble;
         if (i.isEven) {
           nibble = block[byteIndex] & 0x0F;
@@ -122,14 +131,16 @@ class AudioStreamService {
         val = val.clamp(-32768, 32767);
         samples.add(val);
 
-        idx += indexTable[nibble];
+        idx += indexTable[nibble & 0x0F];
         idx = idx.clamp(0, 88);
         step = stepTable[idx];
       }
 
       offset += blockAlign;
+      blockCount++;
     }
 
+    debugPrint("🎵 Decoded $blockCount ADPCM blocks");
     return samples;
   }
 
