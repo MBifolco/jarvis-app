@@ -1,5 +1,3 @@
-// lib/device_screen.dart
-
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -11,7 +9,6 @@ import 'services/audio_player_service.dart';
 class DeviceScreen extends StatefulWidget {
   final BluetoothDevice device;
   final String openaiApiKey;
-
   const DeviceScreen({
     required this.device,
     required this.openaiApiKey,
@@ -23,32 +20,31 @@ class DeviceScreen extends StatefulWidget {
 }
 
 class _DeviceScreenState extends State<DeviceScreen> {
-  late final AudioStreamService _streamSvc;
   late final AudioPlayerService _playerSvc;
-  late final RealtimeService _realtimeSvc;
+  late final RealtimeService   _realtimeSvc;
+  late AudioStreamService      _streamSvc;
 
-  bool _connected     = false;
-  bool _isSending     = false;
-  bool _playOnDevice  = true;  // <-- toggle default
+  bool _connected    = false;
+  bool _isSending    = false;
+  bool _playOnDevice = true;
+  bool _useOpus      = false;     // ← choose at startup
   String _statusMessage = '';
 
   @override
   void initState() {
     super.initState();
     _playerSvc = AudioPlayerService();
-
-    // onAudio will be called for each TTS WAV
     _realtimeSvc = RealtimeService(
       widget.openaiApiKey,
       onAudio: _handleTtsAudio,
     );
-
+    // instantiate with _useOpus flag
     _streamSvc = AudioStreamService(
       widget.device,
+      useOpus: _useOpus,
       onData: () => setState(() {}),
       onDone: _startProcessing,
     );
-
     _initAll();
   }
 
@@ -57,8 +53,8 @@ class _DeviceScreenState extends State<DeviceScreen> {
     await _realtimeSvc.init();
     await _streamSvc.init();
     setState(() {
-      _connected     = true;
-      _statusMessage = '✅ Connected – waiting for audio…';
+      _connected = true;
+      _statusMessage = '✅ Connected – buffering (${_useOpus ? "Opus" : "ADPCM"})';
     });
   }
 
@@ -70,10 +66,9 @@ class _DeviceScreenState extends State<DeviceScreen> {
     super.dispose();
   }
 
-  /// Routes incoming TTS WAV to the chosen output
   Future<void> _handleTtsAudio(Uint8List wav) async {
     if (_playOnDevice) {
-      setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
+      setState(() => _statusMessage = '🔊 Sending TTS to device…');
       await _streamSvc.sendWavToDevice(wav);
       setState(() => _statusMessage = '✅ Played on device');
     } else {
@@ -87,22 +82,15 @@ class _DeviceScreenState extends State<DeviceScreen> {
   Future<void> _startProcessing() async {
     if (_isSending || _streamSvc.audioBuffer.isEmpty) return;
     setState(() {
-      _isSending     = true;
-      _statusMessage = '🎤 Sending your audio to OpenAI…';
+      _isSending = true;
+      _statusMessage = '🎤 Sending to OpenAI…';
     });
-
-    final wav = _streamSvc.getPcmWav();
     try {
-      await _realtimeSvc.sendAudio(wav);
-      setState(() {
-        _statusMessage = '⏳ Awaiting TTS reply…';
-      });
+      await _realtimeSvc.sendAudio(_streamSvc.getPcmWav());
+      setState(() => _statusMessage = '⏳ Awaiting reply…');
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text('Error: $e')));
-      setState(() {
-        _statusMessage = '⚠️ Error: $e';
-      });
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      setState(() => _statusMessage = '⚠️ Error: $e');
     } finally {
       _streamSvc.reset();
       _isSending = false;
@@ -120,7 +108,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
         : total == null
           ? '⏳ Waiting for header…'
           : bufLen < total
-            ? '⏳ Buffering… $bufLen / $total bytes'
+            ? '⏳ Buffering… $bufLen / $total'
             : '✅ Buffered $total bytes';
 
     return Scaffold(
@@ -129,10 +117,22 @@ class _DeviceScreenState extends State<DeviceScreen> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
+            // new toggle if you want to switch in UI before reconnect:
+            SwitchListTile(
+              title: const Text('Use Opus decoding'),
+              value: _useOpus,
+              onChanged: (v) {
+                // note: this only takes effect on re-init
+                setState(() => _useOpus = v);
+              },
+            ),
+            const SizedBox(height: 8),
+
             Text(bufferStatus,   style: Theme.of(ctx).textTheme.bodyMedium),
             const SizedBox(height: 8),
             Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
             const Divider(height: 32),
+
             SwitchListTile(
               title: const Text('Play TTS on device speaker'),
               value: _playOnDevice,
