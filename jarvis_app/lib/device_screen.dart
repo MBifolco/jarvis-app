@@ -27,27 +27,26 @@ class _DeviceScreenState extends State<DeviceScreen> {
   late final AudioPlayerService _playerSvc;
   late final RealtimeService _realtimeSvc;
 
-  bool _connected = false;
-  bool _isSending = false;
+  bool _connected     = false;
+  bool _isSending     = false;
+  bool _playOnDevice  = true;  // <-- toggle default
   String _statusMessage = '';
 
   @override
   void initState() {
     super.initState();
-
     _playerSvc = AudioPlayerService();
-    _realtimeSvc = RealtimeService(widget.openaiApiKey);
+
+    // onAudio will be called for each TTS WAV
+    _realtimeSvc = RealtimeService(
+      widget.openaiApiKey,
+      onAudio: _handleTtsAudio,
+    );
 
     _streamSvc = AudioStreamService(
       widget.device,
-      onData: () {
-        // update buffering UI
-        setState(() {});
-      },
-      onDone: () {
-        // once full WAV is in, fire off the pipeline
-        _startProcessing();
-      },
+      onData: () => setState(() {}),
+      onDone: _startProcessing,
     );
 
     _initAll();
@@ -58,7 +57,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
     await _realtimeSvc.init();
     await _streamSvc.init();
     setState(() {
-      _connected = true;
+      _connected     = true;
       _statusMessage = '✅ Connected – waiting for audio…';
     });
   }
@@ -71,52 +70,58 @@ class _DeviceScreenState extends State<DeviceScreen> {
     super.dispose();
   }
 
-  /// Called automatically when _streamSvc buffers a full WAV,
-  /// or you can hook this to a button if you still want manual control.
+  /// Routes incoming TTS WAV to the chosen output
+  Future<void> _handleTtsAudio(Uint8List wav) async {
+    if (_playOnDevice) {
+      setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
+      await _streamSvc.sendWavToDevice(wav);
+      setState(() => _statusMessage = '✅ Played on device');
+    } else {
+      setState(() => _statusMessage = '🔊 Playing TTS on phone…');
+      await _playerSvc.playBuffer(wav, onFinished: () {
+        setState(() => _statusMessage = '✅ Done playing on phone');
+      });
+    }
+  }
+
   Future<void> _startProcessing() async {
     if (_isSending || _streamSvc.audioBuffer.isEmpty) return;
     setState(() {
-      _isSending = true;
-      _statusMessage = '🎤 Sending to OpenAI Realtime API…';
+      _isSending     = true;
+      _statusMessage = '🎤 Sending your audio to OpenAI…';
     });
 
     final wav = _streamSvc.getPcmWav();
     try {
-      // Send audio to Realtime API
       await _realtimeSvc.sendAudio(wav);
-      
       setState(() {
-        _statusMessage = '✅ Done – ready for next message';
+        _statusMessage = '⏳ Awaiting TTS reply…';
       });
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Error: $e')));
-      }
+      if (mounted) ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('Error: $e')));
       setState(() {
         _statusMessage = '⚠️ Error: $e';
       });
     } finally {
-      // clear buffer so the next WAV can be captured
-      _streamSvc.audioBuffer.clear();
+      _streamSvc.reset();
       _isSending = false;
-      setState(() {});
     }
   }
 
   @override
   Widget build(BuildContext ctx) {
     final bufLen = _streamSvc.audioBuffer.length;
-    final total = _streamSvc.expectedLength;
+    final total  = _streamSvc.expectedLength;
     final bufferStatus = !_connected
-        ? '⏳ Connecting…'
-        : bufLen == 0
-            ? '⏳ Waiting for data…'
-            : total == null
-                ? '⏳ Waiting for header…'
-                : bufLen < total
-                    ? '⏳ Buffering… $bufLen / $total bytes'
-                    : '✅ Buffered $total bytes';
+      ? '⏳ Connecting…'
+      : bufLen == 0
+        ? '⏳ Waiting for data…'
+        : total == null
+          ? '⏳ Waiting for header…'
+          : bufLen < total
+            ? '⏳ Buffering… $bufLen / $total bytes'
+            : '✅ Buffered $total bytes';
 
     return Scaffold(
       appBar: AppBar(title: Text(widget.device.platformName)),
@@ -124,15 +129,20 @@ class _DeviceScreenState extends State<DeviceScreen> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            Text(bufferStatus, style: Theme.of(ctx).textTheme.bodyMedium),
+            Text(bufferStatus,   style: Theme.of(ctx).textTheme.bodyMedium),
             const SizedBox(height: 8),
             Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
+            const Divider(height: 32),
+            SwitchListTile(
+              title: const Text('Play TTS on device speaker'),
+              value: _playOnDevice,
+              onChanged: (v) => setState(() => _playOnDevice = v),
+            ),
             const Spacer(),
-            // optional manual retry:
             ElevatedButton.icon(
               onPressed: (_isSending || !_connected || bufLen == 0)
-                  ? null
-                  : _startProcessing,
+                ? null
+                : _startProcessing,
               icon: const Icon(Icons.send),
               label: Text(_isSending ? 'Working…' : 'Send to OpenAI'),
             ),

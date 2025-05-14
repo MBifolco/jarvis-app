@@ -1,10 +1,17 @@
+// lib/services/audio_stream_service.dart
+
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:math';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
-const String audioCharUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
+/// UUID of the characteristic streaming ADPCM from device → phone
+const String audioNotifyUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
+/// UUID of the characteristic for writing TTS back phone → device
+//const String audioWriteUuid  = '4e5f6a8b-cd12-4fab-90de-1234567890ab';
+const String audioWriteUuid  = 'ab907856-3412-de90-ab4f-12cd8b6a5f4e';
 
 class AudioStreamService {
   final BluetoothDevice device;
@@ -12,17 +19,18 @@ class AudioStreamService {
   final VoidCallback? onDone;
 
   StreamSubscription<List<int>>? _sub;
+  BluetoothCharacteristic? _writeChr;
   final List<int> audioBuffer = [];
   int? expectedLength;
   Uint8List? decodedPcmWav;
 
   AudioStreamService(this.device, {this.onData, this.onDone});
 
+  /// Connects, negotiates MTU, discovers services, hooks up notify + writes
   Future<void> init() async {
     try {
       await device.connect(autoConnect: false);
     } catch (_) {}
-
     await device.requestMtu(500);
     final mtu = await device.mtu.first;
     debugPrint("📏 MTU negotiated: $mtu");
@@ -30,36 +38,45 @@ class AudioStreamService {
     final svcs = await device.discoverServices();
     for (var svc in svcs) {
       for (var chr in svc.characteristics) {
-        if (chr.uuid.toString().toLowerCase() == audioCharUuid &&
+        final id = chr.uuid.toString().toLowerCase();
+        // subscribe for incoming audio
+        // print debug the uuid
+        debugPrint("🔌 Characteristic: $id");
+        if (id == audioNotifyUuid &&
             (chr.properties.notify || chr.properties.indicate)) {
           await chr.setNotifyValue(true);
           _sub = chr.value.listen(_handleChunk);
-          return;
+        }
+        // capture write-capable char for TTS back to device
+        if (id == audioWriteUuid &&
+            (chr.properties.write || chr.properties.writeWithoutResponse)) {
+          _writeChr = chr;
         }
       }
     }
-    throw Exception('Audio characteristic $audioCharUuid not found');
+
+    if (_sub == null) {
+      throw Exception('Audio notify characteristic $audioNotifyUuid not found');
+    }
+    if (_writeChr == null) {
+      throw Exception('Audio write characteristic $audioWriteUuid not found');
+    }
   }
 
   void _handleChunk(List<int> bytes) {
     debugPrint("Audio buffer length: ${bytes.length}");
     audioBuffer.addAll(bytes);
-    // Parse WAV header length once
     if (expectedLength == null && audioBuffer.length >= 46) {
       final header = Uint8List.fromList(audioBuffer.sublist(42, 46));
       expectedLength =
-          46 + ByteData.sublistView(header).getUint32(0, Endian.little);
+        46 + ByteData.sublistView(header).getUint32(0, Endian.little);
       debugPrint("📦 Expected total length: $expectedLength bytes");
     }
-
     onData?.call();
 
-    // Process once full buffer received
     if (expectedLength != null && audioBuffer.length >= expectedLength!) {
-      debugPrint(
-          "🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
-      final adpcmBody =
-          Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
+      debugPrint("🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
+      final adpcmBody = Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
       debugPrint("🎵 ADPCM body length: ${adpcmBody.length} bytes");
 
       final pcm = decodeAdpcmToPcm(adpcmBody);
@@ -69,21 +86,29 @@ class AudioStreamService {
       debugPrint("🎵 Built WAV file: ${decodedPcmWav!.length} bytes");
 
       onDone?.call();
-
-      // Automatically reset buffer state for next message
-      reset();
+      reset();  // prepare for next message
     }
   }
 
-  /// Whisper-ready WAV buffer
-  Uint8List getPcmWav() {
-    if (decodedPcmWav == null) {
-      throw Exception("No audio decoded");
+  /// Call this to send a raw PCM‐WAV back to the device speaker
+  Future<void> sendWavToDevice(Uint8List wav) async {
+    if (_writeChr == null) {
+      throw StateError('Audio write characteristic not initialized');
     }
+    final mtu = await device.mtu.first;
+    final chunkSize = mtu - 3; // ATT overhead
+    for (var i = 0; i < wav.length; i += chunkSize) {
+      final end = min(i + chunkSize, wav.length);
+      final chunk = wav.sublist(i, end);
+      await _writeChr!.write(chunk, withoutResponse: true);
+    }
+  }
+
+  Uint8List getPcmWav() {
+    if (decodedPcmWav == null) throw Exception("No audio decoded");
     return decodedPcmWav!;
   }
 
-  /// Reset stream state
   void reset() {
     audioBuffer.clear();
     expectedLength = null;
