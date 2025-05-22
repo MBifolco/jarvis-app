@@ -1,5 +1,3 @@
-// lib/services/audio_stream_service.dart
-
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:math';
@@ -10,7 +8,6 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 /// UUID of the characteristic streaming ADPCM from device → phone
 const String audioNotifyUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
 /// UUID of the characteristic for writing TTS back phone → device
-//const String audioWriteUuid  = '4e5f6a8b-cd12-4fab-90de-1234567890ab';
 const String audioWriteUuid  = 'ab907856-3412-de90-ab4f-12cd8b6a5f4e';
 
 class AudioStreamService {
@@ -40,7 +37,6 @@ class AudioStreamService {
       for (var chr in svc.characteristics) {
         final id = chr.uuid.toString().toLowerCase();
         // subscribe for incoming audio
-        // print debug the uuid
         debugPrint("🔌 Characteristic: $id");
         if (id == audioNotifyUuid &&
             (chr.properties.notify || chr.properties.indicate)) {
@@ -90,16 +86,20 @@ class AudioStreamService {
     }
   }
 
-  /// Call this to send a raw PCM‐WAV back to the device speaker
+  /// Call this to send a raw PCM‐WAV back to the device speaker,
+  /// but first compress it to IMA ADPCM to reduce payload size.
   Future<void> sendWavToDevice(Uint8List wav) async {
     if (_writeChr == null) {
       throw StateError('Audio write characteristic not initialized');
     }
+    // Compress PCM WAV to ADPCM
+    final adpcm = _encodePcmToAdpcm(wav);
+
     final mtu = await device.mtu.first;
     final chunkSize = mtu - 3; // ATT overhead
-    for (var i = 0; i < wav.length; i += chunkSize) {
-      final end = min(i + chunkSize, wav.length);
-      final chunk = wav.sublist(i, end);
+    for (var i = 0; i < adpcm.length; i += chunkSize) {
+      final end = min(i + chunkSize, adpcm.length);
+      final chunk = adpcm.sublist(i, end);
       await _writeChr!.write(chunk, withoutResponse: true);
     }
   }
@@ -193,6 +193,80 @@ class AudioStreamService {
       ...header.toBytes(),
       ...audioBytes.toBytes(),
     ]);
+  }
+
+  /// Encodes PCM WAV data into IMA ADPCM blocks (blockAlign=256)
+  Uint8List _encodePcmToAdpcm(Uint8List wav) {
+    // Parse WAV header and extract raw 16-bit samples
+    if (wav.length < 44) throw Exception('Invalid WAV buffer');
+    final byteData = ByteData.sublistView(wav);
+    final sampleCount = (wav.length - 44) ~/ 2;
+    final samples = List<int>.generate(sampleCount,
+      (i) => byteData.getInt16(44 + i * 2, Endian.little));
+    const blockAlign = 256;
+    final out = <int>[];
+    int offset = 0;
+
+    while (offset < samples.length) {
+      final endSample = min(offset + (blockAlign - 4) * 2, samples.length);
+      final blockSamples = samples.sublist(offset, endSample);
+
+      // Block header: initial predictor + index + reserved
+      final predictor = blockSamples[0];
+      out.addAll(_uint16le(predictor));
+      int index = 0;
+      out.add(index);
+      out.add(0);  // reserved byte
+      int step = _stepTable[index];
+      int predVal = predictor;
+      int nibblePair = 0;
+      bool hasHigh = false;
+
+      // Encode samples into 4-bit codes
+      for (int i = 1; i < blockSamples.length; i++) {
+        int val = blockSamples[i];
+        int diff = val - predVal;
+        int code = 0;
+        if (diff < 0) { code = 8; diff = -diff; }
+        int tempStep = step;
+        if (diff >= tempStep) { code |= 4; diff -= tempStep; }
+        tempStep >>= 1;
+        if (diff >= tempStep) { code |= 2; diff -= tempStep; }
+        tempStep >>= 1;
+        if (diff >= tempStep) { code |= 1; }
+
+        int delta = step >> 3;
+        if ((code & 1) != 0) delta += step >> 2;
+        if ((code & 2) != 0) delta += step >> 1;
+        if ((code & 4) != 0) delta += step;
+        if ((code & 8) != 0) delta = -delta;
+
+        predVal = (predVal + delta).clamp(-32768, 32767);
+        index = (index + _indexTable[code]).clamp(0, 88);
+        step = _stepTable[index];
+
+        // Pack two 4-bit codes into one byte
+        if (!hasHigh) {
+          nibblePair = code & 0x0F;
+          hasHigh = true;
+        } else {
+          nibblePair |= (code & 0x0F) << 4;
+          out.add(nibblePair);
+          nibblePair = 0;
+          hasHigh = false;
+        }
+      }
+      // If there's an odd leftover nibble
+      if (hasHigh) {
+        out.add(nibblePair);
+      }
+      // Pad block up to blockAlign
+      while (out.length % blockAlign != 0) {
+        out.add(0);
+      }
+      offset += (blockAlign - 4) * 2;
+    }
+    return Uint8List.fromList(out);
   }
 
   List<int> _uint16le(int v) => [v & 0xFF, (v >> 8) & 0xFF];
