@@ -9,8 +9,6 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 const String audioNotifyUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
 /// UUID of the characteristic for writing TTS back phone → device
 const String audioWriteUuid  = 'ab907856-3412-de90-ab4f-12cd8b6a5f4e';
-/// UUID for “config flag
-const String configUuid = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
 
 class AudioStreamService {
   final BluetoothDevice device;
@@ -19,7 +17,6 @@ class AudioStreamService {
 
   StreamSubscription<List<int>>? _sub;
   BluetoothCharacteristic? _writeChr;
-  BluetoothCharacteristic? _configChr;
   final List<int> audioBuffer = [];
   int? expectedLength;
   Uint8List? decodedPcmWav;
@@ -52,11 +49,6 @@ class AudioStreamService {
             (chr.properties.write || chr.properties.writeWithoutResponse)) {
           _writeChr = chr;
         }
-        // config flag
-        if (id == configUuid &&
-            (chr.properties.write || chr.properties.writeWithoutResponse)) {  
-          _configChr = chr;
-        }
       }
     }
 
@@ -65,9 +57,6 @@ class AudioStreamService {
     }
     if (_writeChr == null) {
       throw Exception('Audio write characteristic $audioWriteUuid not found');
-    }
-    if (_configChr == null) {
-      throw Exception('Config characteristic $configUuid not found');
     }
   }
 
@@ -96,6 +85,7 @@ class AudioStreamService {
 
       _inspectRoundTrip();
       onDone?.call();
+      
       reset();  // prepare for next message
     }
   }
