@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
+import 'services/bt_connection_service.dart';
 import 'services/audio_stream_service.dart';
 import 'services/realtime_service.dart';
 import 'services/audio_player_service.dart';
@@ -55,7 +56,9 @@ class _DeviceScreenState extends State<DeviceScreen> {
   Future<void> _initAll() async {
     await _playerSvc.init();
     await _realtimeSvc.init();
-    await _streamSvc.init();
+    final btService = BluetoothConnectionService(widget.device);
+    await btService.initAll([_streamSvc]);
+
     setState(() {
       _connected     = true;
       _statusMessage = '✅ Connected – waiting for audio…';

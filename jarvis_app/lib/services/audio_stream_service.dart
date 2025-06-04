@@ -4,47 +4,38 @@ import 'dart:math';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'bt_connection_service.dart';
 
-/// UUID of the characteristic streaming ADPCM from device → phone
 const String audioNotifyUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
-/// UUID of the characteristic for writing TTS back phone → device
 const String audioWriteUuid  = 'ab907856-3412-de90-ab4f-12cd8b6a5f4e';
 
-class AudioStreamService {
+class AudioStreamService implements BlePeripheralService {
   final BluetoothDevice device;
   final VoidCallback? onData;
   final VoidCallback? onDone;
 
+  final List<int> audioBuffer = [];
   StreamSubscription<List<int>>? _sub;
   BluetoothCharacteristic? _writeChr;
-  final List<int> audioBuffer = [];
-  int? expectedLength;
   Uint8List? decodedPcmWav;
   Uint8List? _outgoingWav;
+  int? expectedLength;
+
+  late final BluetoothConnectionService _connSvc;
 
   AudioStreamService(this.device, {this.onData, this.onDone});
 
-  /// Connects, negotiates MTU, discovers services, hooks up notify + writes
-  Future<void> init() async {
-    try {
-      await device.connect(autoConnect: false);
-    } catch (_) {}
-    await device.requestMtu(500);
-    final mtu = await device.mtu.first;
-    debugPrint("📏 MTU negotiated: $mtu");
-
-    final svcs = await device.discoverServices();
+  @override
+  Future<void> initWithServices(List<BluetoothService> svcs) async {
     for (var svc in svcs) {
       for (var chr in svc.characteristics) {
         final id = chr.uuid.toString().toLowerCase();
-        // subscribe for incoming audio
         debugPrint("🔌 Characteristic: $id");
         if (id == audioNotifyUuid &&
             (chr.properties.notify || chr.properties.indicate)) {
           await chr.setNotifyValue(true);
           _sub = chr.value.listen(_handleChunk);
         }
-        // capture write-capable char for TTS back to device
         if (id == audioWriteUuid &&
             (chr.properties.write || chr.properties.writeWithoutResponse)) {
           _writeChr = chr;
@@ -52,12 +43,8 @@ class AudioStreamService {
       }
     }
 
-    if (_sub == null) {
-      throw Exception('Audio notify characteristic $audioNotifyUuid not found');
-    }
-    if (_writeChr == null) {
-      throw Exception('Audio write characteristic $audioWriteUuid not found');
-    }
+    if (_sub == null) throw Exception('Audio notify characteristic $audioNotifyUuid not found');
+    if (_writeChr == null) throw Exception('Audio write characteristic $audioWriteUuid not found');
   }
 
   void _handleChunk(List<int> bytes) {
@@ -65,8 +52,7 @@ class AudioStreamService {
     audioBuffer.addAll(bytes);
     if (expectedLength == null && audioBuffer.length >= 46) {
       final header = Uint8List.fromList(audioBuffer.sublist(42, 46));
-      expectedLength =
-        46 + ByteData.sublistView(header).getUint32(0, Endian.little);
+      expectedLength = 46 + ByteData.sublistView(header).getUint32(0, Endian.little);
       debugPrint("📦 Expected total length: $expectedLength bytes");
     }
     onData?.call();
@@ -74,71 +60,46 @@ class AudioStreamService {
     if (expectedLength != null && audioBuffer.length >= expectedLength!) {
       debugPrint("🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
       final adpcmBody = Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
-      debugPrint("🎵 ADPCM body length: ${adpcmBody.length} bytes");
-
       final pcm = decodeAdpcmToPcm(adpcmBody);
-      debugPrint("🎵 Decoded to ${pcm.length} PCM samples");
-
       decodedPcmWav = _buildPcmWav(pcm);
       _outgoingWav = decodedPcmWav;
       debugPrint("🎵 Built WAV file: ${decodedPcmWav!.length} bytes");
-
       _inspectRoundTrip();
       onDone?.call();
-      
-      reset();  // prepare for next message
+      reset();
     }
   }
 
   void _inspectRoundTrip() {
-  final orig = _outgoingWav!;
-  final rt   = decodedPcmWav!;
-  // strip 44-byte WAV header, work only on the raw PCM data
-  final origBytes = orig.sublist(44);
-  final rtBytes   = rt.sublist(44);
-  final origBd = ByteData.sublistView(origBytes);
-  final rtBd   = ByteData.sublistView(rtBytes);
-  final sampleCount = min(origBytes.length, rtBytes.length) ~/ 2;
-  int diffs = 0;
-  int maxErr = 0;
-  for (var i = 0; i < sampleCount; i++) {
-    final o = origBd.getInt16(i * 2, Endian.little);
-    final r = rtBd.getInt16(i * 2, Endian.little);
-    final e = (r - o).abs();
-    if (e != 0) diffs++;
-    if (e > maxErr) maxErr = e;
-  }
-  debugPrint('🔍 Round-trip compare: $sampleCount samples; '
-             'differences: $diffs; max sample-error: $maxErr');
-  debugPrint('   orig[0..10]: ${origBytes.sublist(0, 10)}');
-  debugPrint('     rt[0..10]: ${rtBytes.sublist(0, 10)}');
-}
-
-  /// Call this to send a raw PCM‐WAV back to the device speaker,
-  /// but first compress it to IMA ADPCM to reduce payload size.
-  Future<void> sendWavToDevice(Uint8List wav) async {
-    if (_writeChr == null) {
-      throw StateError('Audio write characteristic not initialized');
+    final orig = _outgoingWav!;
+    final rt = decodedPcmWav!;
+    final origBytes = orig.sublist(44);
+    final rtBytes = rt.sublist(44);
+    final origBd = ByteData.sublistView(origBytes);
+    final rtBd = ByteData.sublistView(rtBytes);
+    final sampleCount = min(origBytes.length, rtBytes.length) ~/ 2;
+    int diffs = 0;
+    int maxErr = 0;
+    for (var i = 0; i < sampleCount; i++) {
+      final o = origBd.getInt16(i * 2, Endian.little);
+      final r = rtBd.getInt16(i * 2, Endian.little);
+      final e = (r - o).abs();
+      if (e != 0) diffs++;
+      if (e > maxErr) maxErr = e;
     }
-    // Compress PCM WAV to ADPCM
-    // 1) Compress PCM WAV to ADPCM
+    debugPrint('🔍 Round-trip compare: $sampleCount samples; differences: $diffs; max sample-error: $maxErr');
+  }
+
+  Future<void> sendWavToDevice(Uint8List wav) async {
+    if (_writeChr == null) throw StateError('Audio write characteristic not initialized');
     final adpcm = _encodePcmToAdpcm(wav);
-
-    // 2) Build a 4-byte little-endian header of the ADPCM length
     final header = ByteData(4)..setUint32(0, adpcm.length, Endian.little);
-
-    // 3) Concatenate header + payload
-    final packet = Uint8List.fromList([
-      ...header.buffer.asUint8List(),
-      ...adpcm,
-    ]);
-
+    final packet = Uint8List.fromList([...header.buffer.asUint8List(), ...adpcm]);
     final mtu = await device.mtu.first;
-    final chunkSize = mtu - 3; // ATT overhead
+    final chunkSize = mtu - 3;
     for (var offset = 0; offset < packet.length; offset += chunkSize) {
       final end = min(offset + chunkSize, packet.length);
-      final chunk = packet.sublist(offset, end);
-      await _writeChr!.write(chunk, withoutResponse: true);
+      await _writeChr!.write(packet.sublist(offset, end), withoutResponse: true);
     }
   }
 
@@ -156,10 +117,9 @@ class AudioStreamService {
 
   void dispose() {
     _sub?.cancel();
-    try {
-      device.disconnect();
-    } catch (_) {}
   }
+
+
 
   /// Decodes IMA ADPCM → PCM 16-bit samples
   List<int> decodeAdpcmToPcm(Uint8List input) {
