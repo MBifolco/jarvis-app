@@ -47,15 +47,17 @@ class _DeviceScreenState extends State<DeviceScreen> {
       onAudio: _handleTtsAudio,
     );
 
-    _streamSvc = AudioStreamService(
-      widget.device,
-      onData: () => setState(() {}),
-      onDone: _startProcessing,
-    );
 
     _configSvc = ConfigService(
       widget.device,
       onConfigUpdated: () => setState(() {}),
+    );
+
+    _streamSvc = AudioStreamService(
+      widget.device,
+      onData: () => setState(() {}),
+      onDone: _startProcessing,
+      config: _configSvc.config,
     );
 
     _initAll();

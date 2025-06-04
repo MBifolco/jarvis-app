@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'bt_connection_service.dart';
+import '../models/device_config.dart';
 
 const String audioNotifyUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
 const String audioWriteUuid  = 'ab907856-3412-de90-ab4f-12cd8b6a5f4e';
@@ -17,13 +18,14 @@ class AudioStreamService implements BlePeripheralService {
   final List<int> audioBuffer = [];
   StreamSubscription<List<int>>? _sub;
   BluetoothCharacteristic? _writeChr;
+  
   Uint8List? decodedPcmWav;
   Uint8List? _outgoingWav;
   int? expectedLength;
 
   late final BluetoothConnectionService _connSvc;
-
-  AudioStreamService(this.device, {this.onData, this.onDone});
+  final DeviceConfig config;
+  AudioStreamService(this.device, {required this.config, this.onData, this.onDone});
 
   @override
   Future<void> initWithServices(List<BluetoothService> svcs) async {
@@ -92,11 +94,22 @@ class AudioStreamService implements BlePeripheralService {
 
   Future<void> sendWavToDevice(Uint8List wav) async {
     if (_writeChr == null) throw StateError('Audio write characteristic not initialized');
-    final adpcm = _encodePcmToAdpcm(wav);
-    final header = ByteData(4)..setUint32(0, adpcm.length, Endian.little);
-    final packet = Uint8List.fromList([...header.buffer.asUint8List(), ...adpcm]);
     final mtu = await device.mtu.first;
     final chunkSize = mtu - 3;
+
+    Uint8List packet;
+
+    if (config.compressIncoming) {
+      final adpcm = _encodePcmToAdpcm(wav);
+      final header = ByteData(4)..setUint32(0, adpcm.length, Endian.little);
+      packet = Uint8List.fromList([...header.buffer.asUint8List(), ...adpcm]);
+      debugPrint("📤 Sending compressed audio: ${packet.length} bytes");
+    } else {
+      // Send raw WAV, skipping header
+      packet = wav; //.sublist(44); // PCM data only
+      debugPrint("📤 Sending uncompressed PCM audio: ${packet.length} bytes");
+    }
+
     for (var offset = 0; offset < packet.length; offset += chunkSize) {
       final end = min(offset + chunkSize, packet.length);
       await _writeChr!.write(packet.sublist(offset, end), withoutResponse: true);
