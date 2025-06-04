@@ -9,6 +9,7 @@ import 'services/audio_stream_service.dart';
 import 'services/realtime_service.dart';
 import 'services/audio_player_service.dart';
 import 'services/config_service.dart';
+import '../models/device_config.dart';
 
 class DeviceScreen extends StatefulWidget {
   final BluetoothDevice device;
@@ -29,10 +30,10 @@ class _DeviceScreenState extends State<DeviceScreen> {
   late final AudioPlayerService _playerSvc;
   late final RealtimeService _realtimeSvc;
   late final ConfigService _configSvc;
+  DeviceConfig get _config => _configSvc.config;
 
   bool _connected     = false;
   bool _isSending     = false;
-  bool _playOnDevice  = true;  // <-- toggle default
   String _statusMessage = '';
 
   @override
@@ -54,7 +55,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
     _configSvc = ConfigService(
       widget.device,
-      onConfigUpdate: _handleConfigUpdate,
+      onConfigUpdated: () => setState(() {}),
     );
 
     _initAll();
@@ -83,7 +84,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
   /// Routes incoming TTS WAV to the chosen output
   Future<void> _handleTtsAudio(Uint8List wav) async {
-    if (_playOnDevice) {
+    if (_config.playOnDevice) {
       setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
       await _streamSvc.sendWavToDevice(wav);
       setState(() => _statusMessage = '✅ Played on device');
@@ -120,11 +121,6 @@ class _DeviceScreenState extends State<DeviceScreen> {
     }
   }
 
-  void _handleConfigUpdate(List<int> bytes) {
-    // You can parse these however you'd like.
-    debugPrint("📥 Received config: $bytes");
-  }
-
   @override
   Widget build(BuildContext ctx) {
     final bufLen = _streamSvc.audioBuffer.length;
@@ -150,9 +146,23 @@ class _DeviceScreenState extends State<DeviceScreen> {
             Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
             const Divider(height: 32),
             SwitchListTile(
-              title: const Text('Play TTS on device speaker'),
-              value: _playOnDevice,
-              onChanged: (v) => setState(() => _playOnDevice = v),
+              title: const Text('Compress Incoming Audio'),
+              value: _config.compressIncoming,
+              onChanged: (v) => setState(() => _config.setCompressIncoming(v)),
+            ),
+            SwitchListTile(
+              title: const Text('Send Debug Drops'),
+              value: _config.sendDebugDrops,
+              onChanged: (v) => setState(() => _config.setSendDebugDrops(v)),
+            ),
+            SwitchListTile(
+              title: const Text('Play TTS on Device'),
+              value: _config.playOnDevice,
+              onChanged: (v) => setState(() => _config.setPlayOnDevice(v)),
+            ),
+            ListTile(
+              title: const Text('LED Brightness'),
+              subtitle: Text('${_config.ledBrightness}'),
             ),
             const Spacer(),
             ElevatedButton.icon(
