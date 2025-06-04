@@ -8,6 +8,7 @@ import 'services/bt_connection_service.dart';
 import 'services/audio_stream_service.dart';
 import 'services/realtime_service.dart';
 import 'services/audio_player_service.dart';
+import 'services/config_service.dart';
 
 class DeviceScreen extends StatefulWidget {
   final BluetoothDevice device;
@@ -27,6 +28,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
   late final AudioStreamService _streamSvc;
   late final AudioPlayerService _playerSvc;
   late final RealtimeService _realtimeSvc;
+  late final ConfigService _configSvc;
 
   bool _connected     = false;
   bool _isSending     = false;
@@ -50,6 +52,11 @@ class _DeviceScreenState extends State<DeviceScreen> {
       onDone: _startProcessing,
     );
 
+    _configSvc = ConfigService(
+      widget.device,
+      onConfigUpdate: _handleConfigUpdate,
+    );
+
     _initAll();
   }
 
@@ -57,7 +64,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
     await _playerSvc.init();
     await _realtimeSvc.init();
     final btService = BluetoothConnectionService(widget.device);
-    await btService.initAll([_streamSvc]);
+    await btService.initAll([_streamSvc, _configSvc]);
 
     setState(() {
       _connected     = true;
@@ -70,6 +77,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
     _streamSvc.dispose();
     _playerSvc.dispose();
     _realtimeSvc.dispose();
+    _configSvc.dispose();
     super.dispose();
   }
 
@@ -110,6 +118,11 @@ class _DeviceScreenState extends State<DeviceScreen> {
       _streamSvc.reset();
       _isSending = false;
     }
+  }
+
+  void _handleConfigUpdate(List<int> bytes) {
+    // You can parse these however you'd like.
+    debugPrint("📥 Received config: $bytes");
   }
 
   @override
