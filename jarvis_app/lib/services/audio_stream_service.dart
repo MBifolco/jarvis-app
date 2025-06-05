@@ -1,80 +1,305 @@
-// lib/services/audio_stream_service.dart
-
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:math';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'bt_connection_service.dart';
+import '../models/device_config.dart';
 
-/// Your 128-bit UUID for the audio-WAV characteristic:
-const String audioCharUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
+const String audioNotifyUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
+const String audioWriteUuid  = 'ab907856-3412-de90-ab4f-12cd8b6a5f4e';
 
-/// Buffers precisely one WAV file from the device:
-///  • fires `onData` for every chunk (so your UI can update progress)
-///  • fires `onDone` once the full file is in.
-///  • stays subscribed so when you `reset()` it will pick up the next file.
-class AudioStreamService {
+class AudioStreamService implements BlePeripheralService {
   final BluetoothDevice device;
-
-  /// Called on every incoming chunk (for UI progress).
   final VoidCallback? onData;
-
-  /// Called once, the moment we have the full WAV buffer.
   final VoidCallback? onDone;
 
-  StreamSubscription<List<int>>? _sub;
   final List<int> audioBuffer = [];
+  StreamSubscription<List<int>>? _sub;
+  BluetoothCharacteristic? _writeChr;
+  
+  Uint8List? decodedPcmWav;
+  Uint8List? _outgoingWav;
   int? expectedLength;
 
-  AudioStreamService(this.device, {this.onData, this.onDone});
+  late final BluetoothConnectionService _connSvc;
+  final DeviceConfig config;
+  AudioStreamService(this.device, {required this.config, this.onData, this.onDone});
 
-  Future<void> init() async {
-    // 1) connect (ignore if already)
-    try {
-      await device.connect(autoConnect: false);
-    } catch (_) {}
-
-    // 2) discover & hook up
-    final svcs = await device.discoverServices();
+  @override
+  Future<void> initWithServices(List<BluetoothService> svcs) async {
     for (var svc in svcs) {
       for (var chr in svc.characteristics) {
-        if (chr.uuid.toString().toLowerCase() == audioCharUuid
-            && (chr.properties.notify || chr.properties.indicate)) {
+        final id = chr.uuid.toString().toLowerCase();
+        debugPrint("🔌 Characteristic: $id");
+        if (id == audioNotifyUuid &&
+            (chr.properties.notify || chr.properties.indicate)) {
           await chr.setNotifyValue(true);
-          _sub = chr.lastValueStream.listen(_handleChunk);
-          return;
+          _sub = chr.value.listen(_handleChunk);
+        }
+        if (id == audioWriteUuid &&
+            (chr.properties.write || chr.properties.writeWithoutResponse)) {
+          _writeChr = chr;
         }
       }
     }
-    throw Exception('Audio characteristic $audioCharUuid not found');
+
+    if (_sub == null) throw Exception('Audio notify characteristic $audioNotifyUuid not found');
+    if (_writeChr == null) throw Exception('Audio write characteristic $audioWriteUuid not found');
   }
 
   void _handleChunk(List<int> bytes) {
+    debugPrint("Audio buffer length: ${bytes.length}");
     audioBuffer.addAll(bytes);
-    // parse header once we have 44 bytes
-    if (expectedLength == null && audioBuffer.length >= 44) {
-      final header = Uint8List.fromList(audioBuffer.sublist(40, 44));
-      expectedLength =
-          44 + ByteData.sublistView(header).getUint32(0, Endian.little);
+    if (expectedLength == null && audioBuffer.length >= 46) {
+      final header = Uint8List.fromList(audioBuffer.sublist(42, 46));
+      expectedLength = 46 + ByteData.sublistView(header).getUint32(0, Endian.little);
+      debugPrint("📦 Expected total length: $expectedLength bytes");
     }
     onData?.call();
 
-    // once full file arrived…
     if (expectedLength != null && audioBuffer.length >= expectedLength!) {
+      debugPrint("🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
+      final adpcmBody = Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
+      final pcm = decodeAdpcmToPcm(adpcmBody);
+      decodedPcmWav = _buildPcmWav(pcm);
+      _outgoingWav = decodedPcmWav;
+      debugPrint("🎵 Built WAV file: ${decodedPcmWav!.length} bytes");
+      _inspectRoundTrip();
       onDone?.call();
+      reset();
     }
   }
 
-  /// Clear out the old WAV so the *next* one starts fresh.
+  void _inspectRoundTrip() {
+    final orig = _outgoingWav!;
+    final rt = decodedPcmWav!;
+    final origBytes = orig.sublist(44);
+    final rtBytes = rt.sublist(44);
+    final origBd = ByteData.sublistView(origBytes);
+    final rtBd = ByteData.sublistView(rtBytes);
+    final sampleCount = min(origBytes.length, rtBytes.length) ~/ 2;
+    int diffs = 0;
+    int maxErr = 0;
+    for (var i = 0; i < sampleCount; i++) {
+      final o = origBd.getInt16(i * 2, Endian.little);
+      final r = rtBd.getInt16(i * 2, Endian.little);
+      final e = (r - o).abs();
+      if (e != 0) diffs++;
+      if (e > maxErr) maxErr = e;
+    }
+    debugPrint('🔍 Round-trip compare: $sampleCount samples; differences: $diffs; max sample-error: $maxErr');
+  }
+
+  Future<void> sendWavToDevice(Uint8List wav) async {
+    if (_writeChr == null) throw StateError('Audio write characteristic not initialized');
+    final mtu = await device.mtu.first;
+    final chunkSize = mtu - 3;
+
+    Uint8List packet;
+
+    if (config.compressIncoming) {
+      final adpcm = _encodePcmToAdpcm(wav);
+      final header = ByteData(4)..setUint32(0, adpcm.length, Endian.little);
+      packet = Uint8List.fromList([...header.buffer.asUint8List(), ...adpcm]);
+      debugPrint("📤 Sending compressed audio: ${packet.length} bytes");
+    } else {
+      // Send raw WAV, skipping header
+      packet = wav; //.sublist(44); // PCM data only
+      debugPrint("📤 Sending uncompressed PCM audio: ${packet.length} bytes");
+    }
+
+    for (var offset = 0; offset < packet.length; offset += chunkSize) {
+      final end = min(offset + chunkSize, packet.length);
+      await _writeChr!.write(packet.sublist(offset, end), withoutResponse: true);
+    }
+  }
+
+  Uint8List getPcmWav() {
+    if (decodedPcmWav == null) throw Exception("No audio decoded");
+    return decodedPcmWav!;
+  }
+
   void reset() {
     audioBuffer.clear();
     expectedLength = null;
+    decodedPcmWav = null;
     onData?.call();
   }
 
   void dispose() {
     _sub?.cancel();
-    try {
-      device.disconnect();
-    } catch (_) {}
   }
+
+
+
+  /// Decodes IMA ADPCM → PCM 16-bit samples
+  List<int> decodeAdpcmToPcm(Uint8List input) {
+    const blockAlign = 256;
+    final samples = <int>[];
+    int offset = 0;
+    while (offset + blockAlign <= input.length) {
+      final block = input.sublist(offset, offset + blockAlign);
+      final predictor = ByteData.sublistView(block).getInt16(0, Endian.little);
+      int index = block[2] & 0x7F;
+      int step = _stepTable[index];
+      int val = predictor;
+      samples.add(val);
+      int byteIndex = 4;
+
+      for (int i = 0; i < (blockAlign - 4) * 2; i++) {
+        int nibble;
+        if (i.isEven) {
+          nibble = block[byteIndex] & 0x0F;
+        } else {
+          nibble = block[byteIndex++] >> 4;
+        }
+        int diff = step >> 3;
+        if ((nibble & 1) != 0) diff += step >> 2;
+        if ((nibble & 2) != 0) diff += step >> 1;
+        if ((nibble & 4) != 0) diff += step;
+        if ((nibble & 8) != 0) diff = -diff;
+        val = (val + diff).clamp(-32768, 32767);
+        samples.add(val);
+        index = (index + _indexTable[nibble & 0x0F]).clamp(0, 88);
+        step = _stepTable[index];
+      }
+      offset += blockAlign;
+    }
+    return samples;
+  }
+
+  /// Build 16-bit PCM WAV from samples
+  Uint8List _buildPcmWav(List<int> samples) {
+    const sampleRate = 16000;
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    final byteRate = sampleRate * numChannels * bitsPerSample ~/ 8;
+    final blockAlign = numChannels * bitsPerSample ~/ 8;
+    final dataSize = samples.length * 2;
+    final fileSize = 44 + dataSize;
+
+    final header = BytesBuilder()
+      ..add(utf8.encode('RIFF'))
+      ..add(_uint32le(fileSize - 8))
+      ..add(utf8.encode('WAVE'))
+      ..add(utf8.encode('fmt '))
+      ..add(_uint32le(16))
+      ..add(_uint16le(1))
+      ..add(_uint16le(numChannels))
+      ..add(_uint32le(sampleRate))
+      ..add(_uint32le(byteRate))
+      ..add(_uint16le(blockAlign))
+      ..add(_uint16le(bitsPerSample))
+      ..add(utf8.encode('data'))
+      ..add(_uint32le(dataSize));
+
+    final audioBytes = BytesBuilder();
+    for (final s in samples) {
+      audioBytes.add(_int16le(s));
+    }
+
+    return Uint8List.fromList([
+      ...header.toBytes(),
+      ...audioBytes.toBytes(),
+    ]);
+  }
+
+  /// Encodes PCM WAV data into IMA ADPCM blocks (blockAlign=256)
+  Uint8List _encodePcmToAdpcm(Uint8List wav) {
+    // Parse WAV header and extract raw 16-bit samples
+    if (wav.length < 44) throw Exception('Invalid WAV buffer');
+    final byteData = ByteData.sublistView(wav);
+    final sampleCount = (wav.length - 44) ~/ 2;
+    final samples = List<int>.generate(sampleCount,
+      (i) => byteData.getInt16(44 + i * 2, Endian.little));
+    const blockAlign = 256;
+    final out = <int>[];
+    int offset = 0;
+
+    while (offset < samples.length) {
+      final endSample = min(offset + (blockAlign - 4) * 2, samples.length);
+      final blockSamples = samples.sublist(offset, endSample);
+
+      // Block header: initial predictor + index + reserved
+      final predictor = blockSamples[0];
+      out.addAll(_uint16le(predictor));
+      int index = 0;
+      out.add(index);
+      out.add(0);  // reserved byte
+      int step = _stepTable[index];
+      int predVal = predictor;
+      int nibblePair = 0;
+      bool hasHigh = false;
+
+      // Encode samples into 4-bit codes
+      for (int i = 1; i < blockSamples.length; i++) {
+        int val = blockSamples[i];
+        int diff = val - predVal;
+        int code = 0;
+        if (diff < 0) { code = 8; diff = -diff; }
+        int tempStep = step;
+        if (diff >= tempStep) { code |= 4; diff -= tempStep; }
+        tempStep >>= 1;
+        if (diff >= tempStep) { code |= 2; diff -= tempStep; }
+        tempStep >>= 1;
+        if (diff >= tempStep) { code |= 1; }
+
+        int delta = step >> 3;
+        if ((code & 1) != 0) delta += step >> 2;
+        if ((code & 2) != 0) delta += step >> 1;
+        if ((code & 4) != 0) delta += step;
+        if ((code & 8) != 0) delta = -delta;
+
+        predVal = (predVal + delta).clamp(-32768, 32767);
+        index = (index + _indexTable[code]).clamp(0, 88);
+        step = _stepTable[index];
+
+        // Pack two 4-bit codes into one byte
+        if (!hasHigh) {
+          nibblePair = code & 0x0F;
+          hasHigh = true;
+        } else {
+          nibblePair |= (code & 0x0F) << 4;
+          out.add(nibblePair);
+          nibblePair = 0;
+          hasHigh = false;
+        }
+      }
+      // If there's an odd leftover nibble
+      if (hasHigh) {
+        out.add(nibblePair);
+      }
+      // Pad block up to blockAlign
+      while (out.length % blockAlign != 0) {
+        out.add(0);
+      }
+      offset += (blockAlign - 4) * 2;
+    }
+    return Uint8List.fromList(out);
+  }
+
+  List<int> _uint16le(int v) => [v & 0xFF, (v >> 8) & 0xFF];
+  List<int> _uint32le(int v) => [
+        v & 0xFF,
+        (v >> 8) & 0xFF,
+        (v >> 16) & 0xFF,
+        (v >> 24) & 0xFF,
+      ];
+  List<int> _int16le(int v) => _uint16le(v & 0xFFFF);
+
+  static const List<int> _stepTable = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544,
+    598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845,
+    8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+  ];
+
+  static const List<int> _indexTable = [
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8
+  ];
 }

@@ -4,10 +4,12 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
+import 'services/bt_connection_service.dart';
 import 'services/audio_stream_service.dart';
-import 'services/whisper_service.dart';
-import 'services/chat_service.dart';
+import 'services/realtime_service.dart';
 import 'services/audio_player_service.dart';
+import 'services/config_service.dart';
+import '../models/device_config.dart';
 
 class DeviceScreen extends StatefulWidget {
   final BluetoothDevice device;
@@ -25,32 +27,37 @@ class DeviceScreen extends StatefulWidget {
 
 class _DeviceScreenState extends State<DeviceScreen> {
   late final AudioStreamService _streamSvc;
-  late final AudioPlayerService  _playerSvc;
-  late final WhisperService      _whisperSvc;
-  late final ChatService         _chatSvc;
+  late final AudioPlayerService _playerSvc;
+  late final RealtimeService _realtimeSvc;
+  late final ConfigService _configSvc;
+  DeviceConfig get _config => _configSvc.config;
 
-  bool    _connected    = false;
-  bool    _isSending    = false;
-  String  _statusMessage = '';
+  bool _connected     = false;
+  bool _isSending     = false;
+  String _statusMessage = '';
 
   @override
   void initState() {
     super.initState();
+    _playerSvc = AudioPlayerService();
 
-    _playerSvc  = AudioPlayerService();
-    _whisperSvc = WhisperService(widget.openaiApiKey);
-    _chatSvc    = ChatService(widget.openaiApiKey);
+    // onAudio will be called for each TTS WAV
+    _realtimeSvc = RealtimeService(
+      widget.openaiApiKey,
+      onAudio: _handleTtsAudio,
+    );
+
+
+    _configSvc = ConfigService(
+      widget.device,
+      onConfigUpdated: () => setState(() {}),
+    );
 
     _streamSvc = AudioStreamService(
       widget.device,
-      onData: () {
-        // update buffering UI
-        setState(() {});
-      },
-      onDone: () {
-        // once full WAV is in, fire off the pipeline
-        _startProcessing();
-      },
+      onData: () => setState(() {}),
+      onDone: _startProcessing,
+      config: _configSvc.config,
     );
 
     _initAll();
@@ -58,7 +65,10 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
   Future<void> _initAll() async {
     await _playerSvc.init();
-    await _streamSvc.init();
+    await _realtimeSvc.init();
+    final btService = BluetoothConnectionService(widget.device);
+    await btService.initAll([_streamSvc, _configSvc]);
+
     setState(() {
       _connected     = true;
       _statusMessage = '✅ Connected – waiting for audio…';
@@ -69,52 +79,47 @@ class _DeviceScreenState extends State<DeviceScreen> {
   void dispose() {
     _streamSvc.dispose();
     _playerSvc.dispose();
+    _realtimeSvc.dispose();
+    _configSvc.dispose();
     super.dispose();
   }
 
-  /// Called automatically when _streamSvc buffers a full WAV,
-  /// or you can hook this to a button if you still want manual control.
+  /// Routes incoming TTS WAV to the chosen output
+  Future<void> _handleTtsAudio(Uint8List wav) async {
+    if (_config.playOnDevice) {
+      setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
+      await _streamSvc.sendWavToDevice(wav);
+      setState(() => _statusMessage = '✅ Played on device');
+    } else {
+      setState(() => _statusMessage = '🔊 Playing TTS on phone…');
+      await _playerSvc.playBuffer(wav, onFinished: () {
+        setState(() => _statusMessage = '✅ Done playing on phone');
+      });
+    }
+  }
+
   Future<void> _startProcessing() async {
     if (_isSending || _streamSvc.audioBuffer.isEmpty) return;
     setState(() {
       _isSending     = true;
-      _statusMessage = '📝 Transcribing audio to text…';
+      _statusMessage = '🎤 Sending your audio to OpenAI…';
     });
 
-    final wav = Uint8List.fromList(_streamSvc.audioBuffer);
-
+    final wav = _streamSvc.getPcmWav();
     try {
-      // 1) Whisper
-      final text = await _whisperSvc.transcribe(wav);
+      await _realtimeSvc.sendAudio(wav);
       setState(() {
-        _statusMessage = '🚀 Sending to ChatGPT…';
-      });
-
-      // 2) Chat
-      final reply = await _chatSvc.chat(text);
-      setState(() {
-        _statusMessage = '🗣️ Speaking reply…';
-      });
-
-      // 3) TTS
-      await _playerSvc.speak(reply);
-
-      setState(() {
-        _statusMessage = '✅ Done – ready for next message';
+        _statusMessage = '⏳ Awaiting TTS reply…';
       });
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Error: $e')));
-      }
+      if (mounted) ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('Error: $e')));
       setState(() {
         _statusMessage = '⚠️ Error: $e';
       });
     } finally {
-      // clear buffer so the next WAV can be captured
-      _streamSvc.audioBuffer.clear();
+      _streamSvc.reset();
       _isSending = false;
-      setState(() {});
     }
   }
 
@@ -141,16 +146,33 @@ class _DeviceScreenState extends State<DeviceScreen> {
             Text(bufferStatus,   style: Theme.of(ctx).textTheme.bodyMedium),
             const SizedBox(height: 8),
             Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
+            const Divider(height: 32),
+            SwitchListTile(
+              title: const Text('Compress Incoming Audio'),
+              value: _config.compressIncoming,
+              onChanged: (v) => setState(() => _config.setCompressIncoming(v)),
+            ),
+            SwitchListTile(
+              title: const Text('Send Debug Drops'),
+              value: _config.sendDebugDrops,
+              onChanged: (v) => setState(() => _config.setSendDebugDrops(v)),
+            ),
+            SwitchListTile(
+              title: const Text('Play TTS on Device'),
+              value: _config.playOnDevice,
+              onChanged: (v) => setState(() => _config.setPlayOnDevice(v)),
+            ),
+            ListTile(
+              title: const Text('LED Brightness'),
+              subtitle: Text('${_config.ledBrightness}'),
+            ),
             const Spacer(),
-            // optional manual retry:
             ElevatedButton.icon(
-              onPressed: (_isSending || !_connected || bufLen == 0) 
-                  ? null 
-                  : _startProcessing,
+              onPressed: (_isSending || !_connected || bufLen == 0)
+                ? null
+                : _startProcessing,
               icon: const Icon(Icons.send),
-              label: Text(_isSending
-                ? 'Working…'
-                : 'Send to ChatGPT'),
+              label: Text(_isSending ? 'Working…' : 'Send to OpenAI'),
             ),
           ],
         ),
