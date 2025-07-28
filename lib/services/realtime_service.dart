@@ -87,14 +87,27 @@ class RealtimeService {
     _connected = false;
   }
 
-  Uint8List _buildPcmWav(List<int> samples) {
+  Uint8List _buildPcmWav(List<int> rawBytes) {
     const sampleRate    = 24000, // 24 kHz to match API
           numChannels   = 1,
           bitsPerSample = 16;
     final byteRate   = sampleRate * numChannels * bitsPerSample ~/ 8;
     final blockAlign = numChannels * bitsPerSample ~/ 8;
-    final dataSize   = samples.length;
-    final fileSize   = 44 + dataSize;
+    
+    // Convert raw bytes to 16-bit samples (little-endian)
+    final samples = <int>[];
+    for (int i = 0; i < rawBytes.length - 1; i += 2) {
+      final lowByte = rawBytes[i] & 0xFF;
+      final highByte = rawBytes[i + 1] & 0xFF;
+      // Combine bytes into 16-bit signed sample (little-endian)
+      final sample = (highByte << 8) | lowByte;
+      // Convert to signed 16-bit
+      final signed = sample > 32767 ? sample - 65536 : sample;
+      samples.add(signed);
+    }
+    
+    final dataSize = samples.length * 2;  // 2 bytes per 16-bit sample
+    final fileSize = 44 + dataSize;
 
     final b = BytesBuilder()
       ..add(ascii.encode('RIFF'))
@@ -109,8 +122,12 @@ class RealtimeService {
       ..add(_u16(blockAlign))
       ..add(_u16(bitsPerSample))
       ..add(ascii.encode('data'))
-      ..add(_u32(dataSize))
-      ..add(samples);
+      ..add(_u32(dataSize));
+    
+    // Add 16-bit samples as bytes (little-endian)
+    for (final sample in samples) {
+      b.add(_u16(sample & 0xFFFF));
+    }
 
     return Uint8List.fromList(b.toBytes());
   }

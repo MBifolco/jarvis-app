@@ -1,150 +1,281 @@
-# CLAUDE.md - Jarvis Voice Assistant System
+# CLAUDE.md - Jarvis Mobile Application
 
-This file provides guidance to Claude Code (claude.ai/code) when working across the Jarvis voice assistant system, which consists of two interconnected components in a unified repository structure.
+This file provides guidance to Claude Code when working on the Jarvis mobile application, a Flutter-based companion app for the Jarvis voice assistant hardware device.
 
-## System Overview
-The Jarvis voice assistant is a distributed system with two main components:
-1. **jarvis-device**: ESP32-based firmware for the physical voice assistant device
-2. **jarvis-app**: Flutter mobile application that interfaces with the device
+## Project Overview
 
-## Repository Structure
+The jarvis-app is a Flutter mobile application that serves as the control interface and processing hub for the Jarvis voice assistant device. It connects to the ESP32-based hardware via Bluetooth Low Energy (BLE) and provides voice processing capabilities through OpenAI APIs.
 
-This is a unified repository containing both components. Each component has its own CLAUDE.md file with specific build instructions and architecture details.
+## Architecture
 
-### jarvis-device (ESP32 Firmware)
-**Location**: `./jarvis-device/`
-**Purpose**: ESP32-based voice assistant device firmware
+### Core Components
 
-**Key Features**:
-- Wake word detection using ESP-SR
-- Audio recording with VAD (Voice Activity Detection)
-- Bluetooth Low Energy communication for data transmission
-- Audio playback capabilities
-- Real-time audio processing pipeline
+1. **BLE Communication Layer**
+   - Scans for and connects to Jarvis devices
+   - Manages bidirectional data transfer
+   - Handles audio streaming and configuration
 
-**Architecture**:
-- Dual AFE (Audio Front End) instances for wake vs hold modes
-- I2S audio capture from microphone (GPIO8, GPIO10, GPIO9)
-- I2S audio output to speaker (GPIO6, GPIO5, GPIO7)
-- BLE peripheral that streams compressed audio to mobile app
-- 16kHz sample rate, 30-second max recording sessions
+2. **Audio Processing Pipeline**
+   - Receives compressed audio from device
+   - Processes audio for speech recognition
+   - Handles audio playback responses
 
-**Build System**: ESP-IDF with CMake (see `./jarvis-device/CLAUDE.md` for detailed commands)
+3. **AI Integration**
+   - OpenAI Whisper for speech-to-text
+   - OpenAI Realtime API for conversational AI
+   - Chat completion for text-based interactions
 
-### jarvis-app (Flutter Mobile App)
-**Location**: `./jarvis-app/`
-**Purpose**: Flutter mobile application that connects to jarvis-device
+### Key Services
 
-**Key Features**:
-- BLE client that connects to jarvis-device
+#### `bt_connection_service.dart`
+- Manages BLE device connection lifecycle
+- Handles MTU negotiation for optimal data transfer
+- Coordinates service discovery and initialization
+
+#### `audio_stream_service.dart`
+- Receives compressed audio data via BLE
+- Manages audio buffering and decompression
+- Handles recording state notifications
+
+#### `whisper_service.dart`
+- Converts speech to text using OpenAI Whisper API
+- Processes audio chunks for transcription
+- Manages API authentication and requests
+
+#### `realtime_service.dart`
+- Implements OpenAI Realtime API integration
+- Handles WebSocket communication
+- Manages real-time audio conversation flow
+
+#### `chat_service.dart`
+- Text-based chat functionality
+- OpenAI ChatGPT integration
+- Conversation history management
+
+#### `config_service.dart`
+- Device configuration management
+- Synchronizes settings with hardware
+- Persists user preferences
+
+#### `audio_player_service.dart`
+- Audio playback functionality
+- Handles response audio from AI
+- Manages audio output routing
+
+## Build and Development
+
+### Prerequisites
+- Flutter SDK 3.2.3 or higher
+- Android Studio / Xcode for platform-specific builds
+- OpenAI API key (stored in `.env` file)
+
+### Environment Setup
+Create a `.env` file in the root directory:
+```
+OPENAI_API_KEY=your_api_key_here
+```
+
+### Build Commands
+```bash
+# Get dependencies
+flutter pub get
+
+# Run in debug mode
+flutter run
+
+# Build release APK
+flutter build apk --release
+
+# Build iOS app
+flutter build ios --release
+
+# Run tests
+flutter test
+```
+
+### Development Server
+```bash
+# Run with hot reload
+flutter run -d <device_id>
+
+# List available devices
+flutter devices
+```
+
+## Key Dependencies
+
+- **flutter_blue_plus**: BLE communication
+- **permission_handler**: Runtime permissions
+- **flutter_dotenv**: Environment configuration
+- **openai_realtime_dart**: OpenAI Realtime API
+- **audioplayers/just_audio**: Audio playback
+- **wav**: WAV file processing
+- **http/web_socket_channel**: Network communication
+
+## BLE Protocol
+
+### Device Discovery
 - Scans for devices with "Jarvis" in the name
-- Receives compressed audio data via BLE characteristics
-- Integrates with OpenAI APIs for voice processing
-- Provides user interface for device interaction
+- Connection timeout: 5 seconds
+- Auto-reconnect on disconnect
 
-**Key Services**:
-- `bt_connection_service.dart`: Bluetooth connection management
-- `audio_stream_service.dart`: Audio data handling from device
-- `whisper_service.dart`: Speech-to-text processing
-- `realtime_service.dart`: Real-time audio processing
-- `chat_service.dart`: Chat/conversation management
-- `audio_player_service.dart`: Audio playback
+### Service Structure
+The app expects specific BLE services and characteristics from the device:
+- Audio data characteristic (notifications)
+- Configuration characteristic (read/write)
+- Status characteristic (notifications)
 
-**Build System**: Flutter (see `./jarvis-app/CLAUDE.md` for detailed commands)
+### Data Format
+- Audio: Compressed 16kHz PCM data
+- Configuration: JSON-encoded settings
+- Status: Binary status flags
 
-## Cross-Repository Communication Protocol
+## Audio Specifications
 
-### BLE Communication Flow
-1. **jarvis-device** acts as BLE peripheral advertising as "Jarvis"
-2. **jarvis-app** scans for and connects to Jarvis devices
-3. Device streams compressed audio data to app via BLE characteristics
-4. App sends configuration commands back to device
-5. Device provides real-time status updates (recording state, battery, etc.)
+### Input (from device)
+- Sample Rate: 16kHz
+- Format: Compressed PCM
+- Max Duration: 30 seconds
+- Min Duration: 1 second
 
-### Data Flow
+### Output (to device)
+- Format: MP3/WAV
+- Sample Rate: Device-dependent
+- Delivery: Chunked over BLE
+
+## State Management
+
+The app uses a service-based architecture with:
+- Singleton services for global state
+- Stream-based reactive updates
+- Async/await for all I/O operations
+
+## UI Structure
+
+### Main Screens
+1. **Device List**: Scan and select Jarvis devices
+2. **Device Screen**: Main interaction interface
+3. **Test Audio Screen**: Audio testing utilities
+
+### Navigation
+- Material Design navigation
+- Bottom navigation for main features
+- Modal dialogs for settings
+
+## Error Handling
+
+### BLE Errors
+- Connection failures: Retry with exponential backoff
+- Data corruption: CRC validation
+- Timeout handling: 30-second max for operations
+
+### API Errors
+- Network failures: Offline queue
+- Rate limiting: Backoff strategy
+- Authentication: Token refresh
+
+## Testing
+
+### Unit Tests
+```bash
+flutter test
 ```
-[Microphone] → [jarvis-device] → [BLE] → [jarvis-app] → [OpenAI APIs] → [Response] → [jarvis-app] → [BLE] → [jarvis-device] → [Speaker]
+
+### Integration Tests
+- BLE mock for device communication
+- API mocks for OpenAI services
+- Audio file fixtures in `assets/`
+
+## Security Considerations
+
+1. **API Keys**: Never commit `.env` file
+2. **BLE Security**: Implement pairing/bonding
+3. **Audio Privacy**: Local processing where possible
+4. **Data Storage**: Encrypt sensitive data
+
+## Performance Optimization
+
+1. **Audio Buffering**: Optimize chunk size for BLE MTU
+2. **Memory Management**: Release audio buffers after use
+3. **Battery Usage**: Implement connection idle timeout
+4. **Network Usage**: Batch API requests when possible
+
+## Debugging
+
+### Enable Debug Logging
+```dart
+// In main.dart
+Logger.root.level = Level.ALL;
 ```
 
-## Development Guidelines
+### BLE Debugging
+- Use nRF Connect app for BLE inspection
+- Monitor characteristic notifications
+- Verify MTU negotiation
 
-### Working Across Both Repositories
-When making changes that affect both systems:
+### Audio Debugging
+- Test with `assets/test.mp3`
+- Monitor audio buffer sizes
+- Check sample rate conversions
 
-1. **Always consider the communication protocol**: Changes to BLE characteristics, data formats, or timing in one repo require corresponding changes in the other
-2. **Audio format compatibility**: Ensure audio compression/decompression, sample rates, and formats match between device firmware and mobile app
-3. **Configuration synchronization**: Device configuration changes must be reflected in the mobile app's config service
-4. **Status reporting**: Device status changes should be communicated to and handled by the mobile app
+## Common Issues
 
-### Common Integration Points
-- **BLE service UUIDs and characteristics**: Defined in both repositories
-- **Audio compression format**: Must match between firmware encoding and app decoding
-- **Device configuration structure**: Shared between `config.c` (firmware) and `device_config.dart` (app)
-- **Status/state reporting**: Battery, recording state, connection state
-- **Error handling**: Timeout handling, connection failures, audio processing errors
+1. **BLE Connection Drops**
+   - Check device proximity
+   - Verify battery levels
+   - Review connection parameters
 
-### Testing Cross-Repository Changes
-1. Test BLE communication with both scanning and connection
-2. Verify audio data transmission quality and timing
-3. Test configuration commands from app to device
-4. Validate status reporting from device to app
-5. Test error conditions and recovery scenarios
+2. **Audio Quality**
+   - Verify compression settings
+   - Check sample rate matching
+   - Monitor packet loss
 
-## Key Constants and Compatibility
+3. **API Failures**
+   - Validate API key in `.env`
+   - Check network connectivity
+   - Review rate limits
 
-### Audio Configuration (Must Match)
-- **Sample Rate**: 16kHz (defined in both repositories)
-- **Recording Limit**: 30 seconds max
-- **Minimum Recording**: 1 second (16000 samples)
+## Platform-Specific Notes
 
-### BLE Configuration
-- **Device Name Filter**: "Jarvis" (app scans for devices containing this string)
-- **Connection Timeout**: 5 seconds
-- **Keep-alive**: 20 seconds (device-side timeout)
+### Android
+- Minimum SDK: 21
+- Bluetooth permissions required
+- Location permission for BLE scanning
 
-## Dependencies
+### iOS
+- Minimum iOS: 12.0
+- Bluetooth usage description required
+- Background modes for BLE
 
-### jarvis-device (ESP-IDF)
-- `espressif__esp-sr`: Speech recognition and VAD
-- `espressif__esp-dsp`: Digital signal processing
-- `espressif__esp_audio_codec`: Audio encoding/decoding
+## Development Workflow
 
-### jarvis-app (Flutter)
-- `flutter_blue_plus`: Bluetooth Low Energy communication
-- `permission_handler`: Android/iOS permissions
-- `flutter_dotenv`: Environment configuration (OpenAI API keys)
+1. **Feature Development**
+   - Create feature branch
+   - Implement service layer first
+   - Add UI components
+   - Write tests
+   - Test with actual device
 
-## Development Tips
+2. **Bug Fixes**
+   - Reproduce with device
+   - Add failing test
+   - Implement fix
+   - Verify on multiple devices
 
-### When Working on Audio Features
-- Changes to audio processing in firmware may require corresponding changes in app audio handling
-- Test audio quality and latency across the BLE connection
-- Monitor memory usage on ESP32 side for audio buffers
+3. **Release Process**
+   - Update version in `pubspec.yaml`
+   - Run full test suite
+   - Build release binaries
+   - Test on real devices
+   - Tag release
 
-### When Working on BLE Communication
-- Use BLE debugging tools to verify characteristic updates
-- Test connection stability and reconnection scenarios
-- Verify data integrity across BLE transmission
+## Integration with jarvis-device
 
-### When Working on Configuration
-- Ensure configuration structures match between C structs and Dart models
-- Test configuration persistence on both device and app sides
-- Validate configuration limits and error handling
+When making changes that affect device communication:
+1. Review device firmware BLE implementation
+2. Ensure protocol compatibility
+3. Test with actual hardware
+4. Update both repos if protocol changes
+5. Document any breaking changes
 
-## Project-Specific Instructions
-
-### Component Context Awareness
-When Claude is working in one component, it should:
-1. Be aware of the counterpart component's existence and purpose
-2. Consider cross-component impacts of changes
-3. Suggest testing procedures that involve both systems
-4. Reference component-specific CLAUDE.md files for detailed build/architecture information
-
-### Making Cross-Component Changes
-When changes affect both components:
-1. Start with the device firmware changes (more constrained environment)
-2. Update the mobile app to accommodate firmware changes
-3. Test the complete system integration
-4. Update documentation in both component directories as needed
-
-This shared context ensures Claude can work effectively across both parts of the Jarvis system while maintaining compatibility and understanding the full system architecture.
+This mobile app is the user-facing component of the Jarvis system and must maintain reliable communication with the hardware device while providing a smooth user experience.

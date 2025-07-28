@@ -105,9 +105,11 @@ class AudioStreamService implements BlePeripheralService {
       packet = Uint8List.fromList([...header.buffer.asUint8List(), ...adpcm]);
       debugPrint("📤 Sending compressed audio: ${packet.length} bytes");
     } else {
-      // Send raw WAV, skipping header
-      packet = wav; //.sublist(44); // PCM data only
-      debugPrint("📤 Sending uncompressed PCM audio: ${packet.length} bytes");
+      // Send raw PCM data without WAV header, but with length header
+      final pcmData = wav.sublist(44); // Skip 44-byte WAV header
+      final header = ByteData(4)..setUint32(0, pcmData.length, Endian.little);
+      packet = Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
+      debugPrint("📤 Sending uncompressed PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 4 header)");
     }
 
     for (var offset = 0; offset < packet.length; offset += chunkSize) {
