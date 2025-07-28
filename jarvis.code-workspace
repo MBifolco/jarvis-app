@@ -1,0 +1,125 @@
+{
+	"folders": [
+		{
+			"name": "jarvis-device (ESP32 Firmware)",
+			"path": "./jarvis-device"
+		},
+		{
+			"name": "jarvis-app (Flutter App)",
+			"path": "./jarvis-app"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"*.c": "c",
+			"*.h": "c",
+			"*.dart": "dart",
+			"CMakeLists.txt": "cmake"
+		},
+		"C_Cpp.default.includePath": [
+			"${workspaceFolder}/jarvis-device/main/include",
+			"${workspaceFolder}/jarvis-device/components"
+		],
+		"C_Cpp.default.defines": [
+			"ESP32",
+			"ESP_PLATFORM"
+		],
+		"dart.flutterSdkPath": null,
+		"dart.analysisExcludedFolders": [
+			"${workspaceFolder}/jarvis-device"
+		],
+		"files.exclude": {
+			"**/build/": true,
+			"**/.dart_tool/": true,
+			"**/node_modules/": true
+		}
+	},
+	"extensions": {
+		"recommendations": [
+			"ms-vscode.cpptools",
+			"dart-code.dart-code",
+			"dart-code.flutter",
+			"espressif.esp-idf-extension",
+			"ms-vscode.cmake-tools"
+		]
+	},
+	"tasks": {
+		"version": "2.0.0",
+		"tasks": [
+			{
+				"label": "ESP-IDF: Build Device Firmware",
+				"type": "shell",
+				"command": "idf.py",
+				"args": ["build"],
+				"group": "build",
+				"options": {
+					"cwd": "${workspaceFolder}/jarvis-device"
+				},
+				"problemMatcher": ["$gcc"]
+			},
+			{
+				"label": "ESP-IDF: Flash Device Firmware",
+				"type": "shell",
+				"command": "idf.py",
+				"args": ["flash"],
+				"group": "build",
+				"options": {
+					"cwd": "${workspaceFolder}/jarvis-device"
+				},
+				"dependsOn": "ESP-IDF: Build Device Firmware"
+			},
+			{
+				"label": "ESP-IDF: Monitor Device",
+				"type": "shell",
+				"command": "idf.py",
+				"args": ["monitor"],
+				"group": "test",
+				"options": {
+					"cwd": "${workspaceFolder}/jarvis-device"
+				}
+			},
+			{
+				"label": "Flutter: Get Dependencies",
+				"type": "shell",
+				"command": "flutter",
+				"args": ["pub", "get"],
+				"group": "build",
+				"options": {
+					"cwd": "${workspaceFolder}/jarvis-app"
+				}
+			},
+			{
+				"label": "Flutter: Run App (Debug)",
+				"type": "shell",
+				"command": "flutter",
+				"args": ["run", "--debug"],
+				"group": "build",
+				"options": {
+					"cwd": "${workspaceFolder}/jarvis-app"
+				}
+			},
+			{
+				"label": "Flutter: Build APK",
+				"type": "shell",
+				"command": "flutter",
+				"args": ["build", "apk"],
+				"group": "build",
+				"options": {
+					"cwd": "${workspaceFolder}/jarvis-app"
+				}
+			}
+		]
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "Flutter: Debug App",
+				"type": "dart",
+				"request": "launch",
+				"program": "${workspaceFolder}/jarvis-app/lib/main.dart",
+				"cwd": "${workspaceFolder}/jarvis-app"
+			}
+		]
+	}
+}
