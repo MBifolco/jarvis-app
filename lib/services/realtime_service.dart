@@ -28,6 +28,7 @@ class RealtimeService {
         type: TurnDetectionType.serverVad,
         threshold: 0.8,
       ),
+      instructions: 'You are a helpful assistant. Always respond in English only.',
     );
     _client.on(RealtimeEventType.error, (evt) {
       debugPrint('❌ Realtime API error: ${(evt as RealtimeEventError).error}');
