@@ -28,6 +28,9 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
   int _packetCount = 100;
   int _testDuration = 10; // seconds
   
+  // L2CAP MTU limit (from ESP32 implementation)
+  static const int _maxPacketSize = 512;
+  
   // Test results
   int _packetsSent = 0;
   int _packetsReceived = 0;
@@ -166,14 +169,19 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
     _stopwatch.reset();
     _stopwatch.start();
     
-    // Create test data
-    final testData = Uint8List(_packetSize);
+    // Create test data (ensure it doesn't exceed MTU)
+    final actualPacketSize = _packetSize > _maxPacketSize ? _maxPacketSize : _packetSize;
+    if (_packetSize > _maxPacketSize) {
+      _addLog('Warning: Packet size limited to $_maxPacketSize bytes (L2CAP MTU)');
+    }
+    
+    final testData = Uint8List(actualPacketSize);
     for (int i = 0; i < testData.length; i++) {
       testData[i] = i % 256;
     }
     
-    // Start test timer
-    _testTimer = Timer.periodic(const Duration(milliseconds: 10), (timer) async {
+    // Start test timer (increased delay to prevent L2CAP SDU batching)
+    _testTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) async {
       if (_stopwatch.elapsedMilliseconds >= _testDuration * 1000) {
         _stopThroughputTest();
         return;
@@ -350,10 +358,14 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
                     decoration: const InputDecoration(
                       labelText: 'Packet Size (bytes)',
                       border: OutlineInputBorder(),
+                      helperText: 'Max: 512 bytes (L2CAP MTU)',
                     ),
                     keyboardType: TextInputType.number,
                     controller: TextEditingController(text: _packetSize.toString()),
-                    onChanged: (value) => _packetSize = int.tryParse(value) ?? 512,
+                    onChanged: (value) {
+                      final newSize = int.tryParse(value) ?? 512;
+                      _packetSize = newSize > _maxPacketSize ? _maxPacketSize : newSize;
+                    },
                     enabled: !_testing,
                   ),
                 ),
