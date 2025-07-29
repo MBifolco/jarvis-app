@@ -13,6 +13,8 @@ import 'services/transcript_service.dart';
 import 'services/whisper_service.dart';
 import 'widgets/transcript_widget.dart';
 import '../models/device_config.dart';
+import 'l2cap_test_screen.dart';
+import 'performance_test_screen.dart';
 
 class DeviceScreen extends StatefulWidget {
   final BluetoothDevice device;
@@ -40,6 +42,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
   bool _connected     = false;
   bool _isSending     = false;
   String _statusMessage = '';
+  bool _configExpanded = false;
 
   @override
   void initState() {
@@ -194,25 +197,80 @@ class _DeviceScreenState extends State<DeviceScreen> {
             const SizedBox(height: 8),
             Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
             const Divider(height: 32),
-            SwitchListTile(
-              title: const Text('Compress Incoming Audio'),
-              value: _config.compressIncoming,
-              onChanged: (v) => setState(() => _config.setCompressIncoming(v)),
+            
+            // Collapsible Config Section
+            ExpansionTile(
+              title: const Text('Device Configuration'),
+              leading: const Icon(Icons.settings),
+              initiallyExpanded: _configExpanded,
+              onExpansionChanged: (expanded) {
+                setState(() {
+                  _configExpanded = expanded;
+                });
+              },
+              children: [
+                SwitchListTile(
+                  title: const Text('Compress Incoming Audio'),
+                  value: _config.compressIncoming,
+                  onChanged: (v) => setState(() => _config.setCompressIncoming(v)),
+                ),
+                SwitchListTile(
+                  title: const Text('Send Debug Drops'),
+                  value: _config.sendDebugDrops,
+                  onChanged: (v) => setState(() => _config.setSendDebugDrops(v)),
+                ),
+                SwitchListTile(
+                  title: const Text('Play TTS on Device'),
+                  value: _config.playOnDevice,
+                  onChanged: (v) => setState(() => _config.setPlayOnDevice(v)),
+                ),
+                ListTile(
+                  title: const Text('LED Brightness'),
+                  subtitle: Text('${_config.ledBrightness}'),
+                ),
+              ],
             ),
-            SwitchListTile(
-              title: const Text('Send Debug Drops'),
-              value: _config.sendDebugDrops,
-              onChanged: (v) => setState(() => _config.setSendDebugDrops(v)),
+            
+            const SizedBox(height: 16),
+            
+            // L2CAP Test Buttons
+            const Divider(height: 32),
+            const Text('L2CAP Testing', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => L2capTestScreen(device: widget.device),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.chat),
+                    label: const Text('Text Exchange'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => PerformanceTestScreen(device: widget.device),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.speed),
+                    label: const Text('Performance'),
+                  ),
+                ),
+              ],
             ),
-            SwitchListTile(
-              title: const Text('Play TTS on Device'),
-              value: _config.playOnDevice,
-              onChanged: (v) => setState(() => _config.setPlayOnDevice(v)),
-            ),
-            ListTile(
-              title: const Text('LED Brightness'),
-              subtitle: Text('${_config.ledBrightness}'),
-            ),
+            
             const SizedBox(height: 16),
             TranscriptWidget(transcriptService: _transcriptSvc),
             const Spacer(),

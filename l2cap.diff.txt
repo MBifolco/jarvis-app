@@ -1,0 +1,1543 @@
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index cb3f157..12e033e 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -24,7 +24,7 @@ android {
+         applicationId = "com.example.jarvis_app"
+         // You can update the following values to match your application needs.
+         // For more information, see: https://flutter.dev/to/review-gradle-config.
+-        minSdk = 24
++        minSdk = 29
+         targetSdk = flutter.targetSdkVersion
+         versionCode = flutter.versionCode
+         versionName = flutter.versionName
+diff --git a/android/app/src/main/kotlin/com/example/jarvis_app/L2capPlugin.kt b/android/app/src/main/kotlin/com/example/jarvis_app/L2capPlugin.kt
+new file mode 100644
+index 0000000..cecb54f
+--- /dev/null
++++ b/android/app/src/main/kotlin/com/example/jarvis_app/L2capPlugin.kt
+@@ -0,0 +1,252 @@
++package com.example.jarvis_app
++
++import android.bluetooth.BluetoothAdapter
++import android.bluetooth.BluetoothDevice
++import android.bluetooth.BluetoothSocket
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++import io.flutter.embedding.engine.FlutterEngine
++import io.flutter.plugin.common.EventChannel
++import io.flutter.plugin.common.MethodChannel
++import kotlinx.coroutines.*
++import java.io.IOException
++import java.io.InputStream
++import java.io.OutputStream
++import java.util.UUID
++
++class L2capPlugin(private val flutterEngine: FlutterEngine) : 
++    MethodChannel.MethodCallHandler, 
++    EventChannel.StreamHandler {
++    
++    companion object {
++        private const val TAG = "L2capPlugin"
++        private const val METHOD_CHANNEL = "jarvis_app/l2cap"
++        private const val EVENT_CHANNEL = "jarvis_app/l2cap_events"
++    }
++    
++    private var methodChannel: MethodChannel? = null
++    private var eventChannel: EventChannel? = null
++    private var eventSink: EventChannel.EventSink? = null
++    
++    private var bluetoothAdapter: BluetoothAdapter? = null
++    private var l2capSocket: BluetoothSocket? = null
++    private var inputStream: InputStream? = null
++    private var outputStream: OutputStream? = null
++    private var readingJob: Job? = null
++    
++    private val coroutineScope = CoroutineScope(Dispatchers.IO)
++    
++    fun register() {
++        methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL)
++        methodChannel?.setMethodCallHandler(this)
++        
++        eventChannel = EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL)
++        eventChannel?.setStreamHandler(this)
++        
++        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
++    }
++    
++    override fun onMethodCall(call: io.flutter.plugin.common.MethodCall, result: MethodChannel.Result) {
++        when (call.method) {
++            "connect" -> {
++                val address = call.argument<String>("address")
++                val psm = call.argument<Int>("psm")
++                
++                if (address == null || psm == null) {
++                    result.error("INVALID_ARGS", "Address and PSM required", null)
++                    return
++                }
++                
++                coroutineScope.launch {
++                    val success = connectL2cap(address, psm)
++                    withContext(Dispatchers.Main) {
++                        result.success(success)
++                    }
++                }
++            }
++            
++            "sendMessage" -> {
++                val message = call.argument<String>("message")
++                if (message == null) {
++                    result.error("INVALID_ARGS", "Message required", null)
++                    return
++                }
++                
++                coroutineScope.launch {
++                    val success = sendMessage(message)
++                    withContext(Dispatchers.Main) {
++                        result.success(success)
++                    }
++                }
++            }
++            
++            "sendBytes" -> {
++                val data = call.argument<ByteArray>("data")
++                if (data == null) {
++                    result.error("INVALID_ARGS", "Data required", null)
++                    return
++                }
++                
++                coroutineScope.launch {
++                    val success = sendBytes(data)
++                    withContext(Dispatchers.Main) {
++                        result.success(success)
++                    }
++                }
++            }
++            
++            "disconnect" -> {
++                disconnect()
++                result.success(null)
++            }
++            
++            else -> result.notImplemented()
++        }
++    }
++    
++    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
++        eventSink = events
++    }
++    
++    override fun onCancel(arguments: Any?) {
++        eventSink = null
++    }
++    
++    @Suppress("DEPRECATION")
++    private suspend fun connectL2cap(address: String, psm: Int): Boolean {
++        return withContext(Dispatchers.IO) {
++            try {
++                disconnect() // Clean up any existing connection
++                
++                val device: BluetoothDevice = bluetoothAdapter?.getRemoteDevice(address)
++                    ?: throw IOException("Device not found")
++                
++                Log.d(TAG, "Connecting to L2CAP PSM $psm on device $address")
++                
++                // Create L2CAP socket
++                l2capSocket = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++                    device.createInsecureL2capChannel(psm)
++                } else {
++                    // For older Android versions, we'd need reflection or alternative approach
++                    throw IOException("L2CAP requires Android Q (API 29) or higher")
++                }
++                
++                // Connect to the socket
++                l2capSocket?.connect()
++                
++                // Get streams
++                inputStream = l2capSocket?.inputStream
++                outputStream = l2capSocket?.outputStream
++                
++                // Start reading thread
++                startReading()
++                
++                // Notify Flutter
++                sendEvent("connected", null)
++                
++                Log.d(TAG, "L2CAP connected successfully")
++                true
++                
++            } catch (e: Exception) {
++                Log.e(TAG, "L2CAP connection failed", e)
++                sendEvent("error", e.message)
++                disconnect()
++                false
++            }
++        }
++    }
++    
++    private fun startReading() {
++        readingJob = coroutineScope.launch {
++            val buffer = ByteArray(1024)
++            
++            try {
++                while (isActive && l2capSocket?.isConnected == true) {
++                    val bytesRead = inputStream?.read(buffer) ?: -1
++                    
++                    if (bytesRead > 0) {
++                        val message = String(buffer, 0, bytesRead, Charsets.UTF_8)
++                        Log.d(TAG, "Received: $message")
++                        sendEvent("message", message)
++                    } else if (bytesRead == -1) {
++                        break // End of stream
++                    }
++                }
++            } catch (e: IOException) {
++                Log.e(TAG, "Error reading from L2CAP", e)
++                sendEvent("error", "Read error: ${e.message}")
++            }
++            
++            withContext(Dispatchers.Main) {
++                disconnect()
++            }
++        }
++    }
++    
++    private suspend fun sendMessage(message: String): Boolean {
++        return withContext(Dispatchers.IO) {
++            try {
++                val bytes = message.toByteArray(Charsets.UTF_8)
++                outputStream?.write(bytes)
++                outputStream?.flush()
++                Log.d(TAG, "Sent: $message")
++                true
++            } catch (e: IOException) {
++                Log.e(TAG, "Error sending message", e)
++                sendEvent("error", "Send error: ${e.message}")
++                false
++            }
++        }
++    }
++    
++    private suspend fun sendBytes(data: ByteArray): Boolean {
++        return withContext(Dispatchers.IO) {
++            try {
++                outputStream?.write(data)
++                outputStream?.flush()
++                Log.d(TAG, "Sent ${data.size} bytes")
++                true
++            } catch (e: IOException) {
++                Log.e(TAG, "Error sending bytes", e)
++                sendEvent("error", "Send error: ${e.message}")
++                false
++            }
++        }
++    }
++    
++    private fun disconnect() {
++        readingJob?.cancel()
++        
++        try {
++            inputStream?.close()
++            outputStream?.close()
++            l2capSocket?.close()
++        } catch (e: IOException) {
++            Log.e(TAG, "Error closing L2CAP socket", e)
++        }
++        
++        inputStream = null
++        outputStream = null
++        l2capSocket = null
++        
++        sendEvent("disconnected", null)
++    }
++    
++    private fun sendEvent(type: String, data: Any?) {
++        Handler(Looper.getMainLooper()).post {
++            eventSink?.success(mapOf(
++                "type" to type,
++                "data" to data
++            ))
++        }
++    }
++    
++    fun dispose() {
++        disconnect()
++        coroutineScope.cancel()
++        methodChannel?.setMethodCallHandler(null)
++        eventChannel?.setStreamHandler(null)
++    }
++}
+\ No newline at end of file
+diff --git a/android/app/src/main/kotlin/com/example/jarvis_app/MainActivity.kt b/android/app/src/main/kotlin/com/example/jarvis_app/MainActivity.kt
+index 94a278f..ea0f4de 100644
+--- a/android/app/src/main/kotlin/com/example/jarvis_app/MainActivity.kt
++++ b/android/app/src/main/kotlin/com/example/jarvis_app/MainActivity.kt
+@@ -1,5 +1,21 @@
+ package com.example.jarvis_app
+ 
+ import io.flutter.embedding.android.FlutterActivity
++import io.flutter.embedding.engine.FlutterEngine
+ 
+-class MainActivity : FlutterActivity()
++class MainActivity : FlutterActivity() {
++    private var l2capPlugin: L2capPlugin? = null
++    
++    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
++        super.configureFlutterEngine(flutterEngine)
++        
++        // Register L2CAP plugin
++        l2capPlugin = L2capPlugin(flutterEngine)
++        l2capPlugin?.register()
++    }
++    
++    override fun onDestroy() {
++        l2capPlugin?.dispose()
++        super.onDestroy()
++    }
++}
+diff --git a/lib/device_screen.dart b/lib/device_screen.dart
+index 8fb6d3d..094ff78 100644
+--- a/lib/device_screen.dart
++++ b/lib/device_screen.dart
+@@ -12,6 +12,8 @@ import 'services/config_service.dart';
+ import 'services/transcript_service.dart';
+ import 'services/whisper_service.dart';
+ import 'widgets/transcript_widget.dart';
++import 'l2cap_test_screen.dart';
++import 'performance_test_screen.dart';
+ import '../models/device_config.dart';
+ 
+ class DeviceScreen extends StatefulWidget {
+@@ -40,6 +42,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
+   bool _connected     = false;
+   bool _isSending     = false;
+   String _statusMessage = '';
++  bool _configExpanded = false;
+ 
+   @override
+   void initState() {
+@@ -194,34 +197,75 @@ class _DeviceScreenState extends State<DeviceScreen> {
+             const SizedBox(height: 8),
+             Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
+             const Divider(height: 32),
+-            SwitchListTile(
+-              title: const Text('Compress Incoming Audio'),
+-              value: _config.compressIncoming,
+-              onChanged: (v) => setState(() => _config.setCompressIncoming(v)),
+-            ),
+-            SwitchListTile(
+-              title: const Text('Send Debug Drops'),
+-              value: _config.sendDebugDrops,
+-              onChanged: (v) => setState(() => _config.setSendDebugDrops(v)),
+-            ),
+-            SwitchListTile(
+-              title: const Text('Play TTS on Device'),
+-              value: _config.playOnDevice,
+-              onChanged: (v) => setState(() => _config.setPlayOnDevice(v)),
+-            ),
+-            ListTile(
+-              title: const Text('LED Brightness'),
+-              subtitle: Text('${_config.ledBrightness}'),
++            ExpansionTile(
++              title: const Text('Device Configuration'),
++              leading: const Icon(Icons.settings),
++              initiallyExpanded: _configExpanded,
++              onExpansionChanged: (expanded) {
++                setState(() => _configExpanded = expanded);
++              },
++              children: [
++                SwitchListTile(
++                  title: const Text('Compress Incoming Audio'),
++                  value: _config.compressIncoming,
++                  onChanged: (v) => setState(() => _config.setCompressIncoming(v)),
++                ),
++                SwitchListTile(
++                  title: const Text('Send Debug Drops'),
++                  value: _config.sendDebugDrops,
++                  onChanged: (v) => setState(() => _config.setSendDebugDrops(v)),
++                ),
++                SwitchListTile(
++                  title: const Text('Play TTS on Device'),
++                  value: _config.playOnDevice,
++                  onChanged: (v) => setState(() => _config.setPlayOnDevice(v)),
++                ),
++                ListTile(
++                  title: const Text('LED Brightness'),
++                  subtitle: Text('${_config.ledBrightness}'),
++                ),
++              ],
+             ),
+             const SizedBox(height: 16),
+             TranscriptWidget(transcriptService: _transcriptSvc),
+             const Spacer(),
+-            ElevatedButton.icon(
+-              onPressed: (_isSending || !_connected || bufLen == 0)
+-                ? null
+-                : _startProcessing,
+-              icon: const Icon(Icons.send),
+-              label: Text(_isSending ? 'Working…' : 'Send to OpenAI'),
++            Wrap(
++              alignment: WrapAlignment.spaceEvenly,
++              spacing: 8,
++              runSpacing: 8,
++              children: [
++                ElevatedButton.icon(
++                  onPressed: _connected ? () {
++                    Navigator.push(
++                      context,
++                      MaterialPageRoute(
++                        builder: (context) => L2capTestScreen(device: widget.device),
++                      ),
++                    );
++                  } : null,
++                  icon: const Icon(Icons.chat),
++                  label: const Text('L2CAP Test'),
++                ),
++                ElevatedButton.icon(
++                  onPressed: _connected ? () {
++                    Navigator.push(
++                      context,
++                      MaterialPageRoute(
++                        builder: (context) => PerformanceTestScreen(device: widget.device),
++                      ),
++                    );
++                  } : null,
++                  icon: const Icon(Icons.speed),
++                  label: const Text('Performance'),
++                ),
++                ElevatedButton.icon(
++                  onPressed: (_isSending || !_connected || bufLen == 0)
++                    ? null
++                    : _startProcessing,
++                  icon: const Icon(Icons.send),
++                  label: Text(_isSending ? 'Working…' : 'Send to OpenAI'),
++                ),
++              ],
+             ),
+           ],
+         ),
+diff --git a/lib/l2cap_test_screen.dart b/lib/l2cap_test_screen.dart
+new file mode 100644
+index 0000000..dd28975
+--- /dev/null
++++ b/lib/l2cap_test_screen.dart
+@@ -0,0 +1,348 @@
++// lib/l2cap_test_screen.dart
++
++import 'dart:async';
++import 'package:flutter/material.dart';
++import 'package:flutter_blue_plus/flutter_blue_plus.dart';
++import 'services/l2cap_service.dart';
++
++class L2capTestScreen extends StatefulWidget {
++  final BluetoothDevice device;
++  
++  const L2capTestScreen({
++    required this.device,
++    super.key,
++  });
++  
++  @override
++  State<L2capTestScreen> createState() => _L2capTestScreenState();
++}
++
++class _L2capTestScreenState extends State<L2capTestScreen> {
++  final L2capService _l2capService = L2capService();
++  final TextEditingController _messageController = TextEditingController();
++  final List<ChatMessage> _messages = [];
++  final ScrollController _scrollController = ScrollController();
++  
++  bool _connected = false;
++  int? _psm;
++  StreamSubscription<String>? _messageSubscription;
++  
++  @override
++  void initState() {
++    super.initState();
++    _init();
++  }
++  
++  Future<void> _init() async {
++    // Initialize L2CAP service
++    await _l2capService.init();
++    
++    // Subscribe to incoming messages
++    _messageSubscription = _l2capService.messageStream.listen((message) {
++      setState(() {
++        _messages.add(ChatMessage(
++          text: message,
++          isMe: false,
++          timestamp: DateTime.now(),
++        ));
++      });
++      _scrollToBottom();
++    });
++    
++    // Read PSM from GATT characteristic
++    await _readPsmFromGatt();
++  }
++  
++  Future<void> _readPsmFromGatt() async {
++    try {
++      // PSM characteristic UUID (matches ESP32 l2cap_psm_uuid)
++      const psmUuid = '88776655-4433-2211-f0de-bc9a78563412';
++      
++      final services = await widget.device.discoverServices();
++      
++      for (final service in services) {
++        for (final char in service.characteristics) {
++          if (char.uuid.toString().toLowerCase() == psmUuid) {
++            final value = await char.read();
++            if (value.length >= 2) {
++              // PSM is 16-bit little-endian
++              _psm = value[0] | (value[1] << 8);
++              setState(() {});
++              debugPrint('Read PSM from GATT: $_psm');
++              
++              // Auto-connect to L2CAP
++              _connectL2cap();
++              return;
++            }
++          }
++        }
++      }
++      
++      // If PSM not found in GATT, use default
++      _psm = 0x80;
++      setState(() {});
++      debugPrint('Using default PSM: $_psm');
++    } catch (e) {
++      debugPrint('Error reading PSM: $e');
++      _psm = 0x80;
++      setState(() {});
++    }
++  }
++  
++  Future<void> _connectL2cap() async {
++    if (_psm == null) return;
++    
++    final success = await _l2capService.connect(
++      widget.device.remoteId.toString(),
++      _psm!,
++    );
++    
++    setState(() {
++      _connected = success;
++    });
++    
++    if (success) {
++      _addSystemMessage('Connected to L2CAP channel');
++    } else {
++      _addSystemMessage('Failed to connect to L2CAP');
++    }
++  }
++  
++  void _sendMessage() {
++    final text = _messageController.text.trim();
++    if (text.isEmpty || !_connected) return;
++    
++    // Add to chat
++    setState(() {
++      _messages.add(ChatMessage(
++        text: text,
++        isMe: true,
++        timestamp: DateTime.now(),
++      ));
++    });
++    
++    // Send via L2CAP
++    _l2capService.sendMessage(text);
++    
++    // Clear input
++    _messageController.clear();
++    _scrollToBottom();
++  }
++  
++  void _addSystemMessage(String text) {
++    setState(() {
++      _messages.add(ChatMessage(
++        text: text,
++        isMe: false,
++        timestamp: DateTime.now(),
++        isSystem: true,
++      ));
++    });
++    _scrollToBottom();
++  }
++  
++  void _scrollToBottom() {
++    Future.delayed(const Duration(milliseconds: 100), () {
++      if (_scrollController.hasClients) {
++        _scrollController.animateTo(
++          _scrollController.position.maxScrollExtent,
++          duration: const Duration(milliseconds: 200),
++          curve: Curves.easeOut,
++        );
++      }
++    });
++  }
++  
++  @override
++  void dispose() {
++    _messageSubscription?.cancel();
++    _l2capService.dispose();
++    _messageController.dispose();
++    _scrollController.dispose();
++    super.dispose();
++  }
++  
++  @override
++  Widget build(BuildContext context) {
++    return Scaffold(
++      appBar: AppBar(
++        title: const Text('L2CAP Test'),
++        actions: [
++          if (_psm != null)
++            Padding(
++              padding: const EdgeInsets.all(8.0),
++              child: Chip(
++                label: Text('PSM: 0x${_psm!.toRadixString(16).toUpperCase()}'),
++              ),
++            ),
++        ],
++      ),
++      body: Column(
++        children: [
++          // Connection status
++          Container(
++            padding: const EdgeInsets.all(16),
++            color: _connected ? Colors.green.shade100 : Colors.red.shade100,
++            child: Row(
++              children: [
++                Icon(
++                  _connected ? Icons.check_circle : Icons.error,
++                  color: _connected ? Colors.green : Colors.red,
++                ),
++                const SizedBox(width: 8),
++                Text(
++                  _connected ? 'L2CAP Connected' : 'L2CAP Disconnected',
++                  style: TextStyle(
++                    color: _connected ? Colors.green.shade800 : Colors.red.shade800,
++                    fontWeight: FontWeight.bold,
++                  ),
++                ),
++                const Spacer(),
++                if (!_connected && _psm != null)
++                  ElevatedButton(
++                    onPressed: _connectL2cap,
++                    child: const Text('Connect'),
++                  ),
++              ],
++            ),
++          ),
++          
++          // Chat messages
++          Expanded(
++            child: ListView.builder(
++              controller: _scrollController,
++              padding: const EdgeInsets.all(16),
++              itemCount: _messages.length,
++              itemBuilder: (context, index) {
++                final message = _messages[index];
++                return _ChatBubble(message: message);
++              },
++            ),
++          ),
++          
++          // Input field
++          Container(
++            padding: const EdgeInsets.all(16),
++            decoration: BoxDecoration(
++              color: Colors.grey.shade100,
++              boxShadow: [
++                BoxShadow(
++                  color: Colors.black.withOpacity(0.1),
++                  blurRadius: 4,
++                  offset: const Offset(0, -2),
++                ),
++              ],
++            ),
++            child: Row(
++              children: [
++                Expanded(
++                  child: TextField(
++                    controller: _messageController,
++                    decoration: const InputDecoration(
++                      hintText: 'Type a message...',
++                      border: OutlineInputBorder(),
++                    ),
++                    onSubmitted: (_) => _sendMessage(),
++                    enabled: _connected,
++                  ),
++                ),
++                const SizedBox(width: 8),
++                IconButton(
++                  icon: const Icon(Icons.send),
++                  onPressed: _connected ? _sendMessage : null,
++                  color: Theme.of(context).primaryColor,
++                ),
++              ],
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++}
++
++class ChatMessage {
++  final String text;
++  final bool isMe;
++  final DateTime timestamp;
++  final bool isSystem;
++  
++  ChatMessage({
++    required this.text,
++    required this.isMe,
++    required this.timestamp,
++    this.isSystem = false,
++  });
++}
++
++class _ChatBubble extends StatelessWidget {
++  final ChatMessage message;
++  
++  const _ChatBubble({required this.message});
++  
++  @override
++  Widget build(BuildContext context) {
++    if (message.isSystem) {
++      return Center(
++        child: Container(
++          margin: const EdgeInsets.symmetric(vertical: 8),
++          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
++          decoration: BoxDecoration(
++            color: Colors.grey.shade200,
++            borderRadius: BorderRadius.circular(16),
++          ),
++          child: Text(
++            message.text,
++            style: TextStyle(
++              color: Colors.grey.shade700,
++              fontStyle: FontStyle.italic,
++            ),
++          ),
++        ),
++      );
++    }
++    
++    return Align(
++      alignment: message.isMe ? Alignment.centerRight : Alignment.centerLeft,
++      child: Container(
++        margin: const EdgeInsets.symmetric(vertical: 4),
++        padding: const EdgeInsets.all(12),
++        constraints: BoxConstraints(
++          maxWidth: MediaQuery.of(context).size.width * 0.7,
++        ),
++        decoration: BoxDecoration(
++          color: message.isMe
++              ? Theme.of(context).primaryColor
++              : Colors.grey.shade300,
++          borderRadius: BorderRadius.only(
++            topLeft: const Radius.circular(16),
++            topRight: const Radius.circular(16),
++            bottomLeft: Radius.circular(message.isMe ? 16 : 4),
++            bottomRight: Radius.circular(message.isMe ? 4 : 16),
++          ),
++        ),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Text(
++              message.text,
++              style: TextStyle(
++                color: message.isMe ? Colors.white : Colors.black87,
++              ),
++            ),
++            const SizedBox(height: 4),
++            Text(
++              '${message.timestamp.hour.toString().padLeft(2, '0')}:${message.timestamp.minute.toString().padLeft(2, '0')}',
++              style: TextStyle(
++                fontSize: 11,
++                color: message.isMe
++                    ? Colors.white.withOpacity(0.7)
++                    : Colors.black54,
++              ),
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++}
+\ No newline at end of file
+diff --git a/lib/performance_test_screen.dart b/lib/performance_test_screen.dart
+new file mode 100644
+index 0000000..39ad021
+--- /dev/null
++++ b/lib/performance_test_screen.dart
+@@ -0,0 +1,526 @@
++// lib/performance_test_screen.dart
++
++import 'dart:async';
++import 'dart:math';
++import 'package:flutter/material.dart';
++import 'package:flutter_blue_plus/flutter_blue_plus.dart';
++import 'services/l2cap_service.dart';
++
++class PerformanceTestScreen extends StatefulWidget {
++  final BluetoothDevice device;
++  
++  const PerformanceTestScreen({
++    required this.device,
++    super.key,
++  });
++  
++  @override
++  State<PerformanceTestScreen> createState() => _PerformanceTestScreenState();
++}
++
++class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
++  final L2capService _l2capService = L2capService();
++  
++  bool _l2capConnected = false;
++  bool _gattConnected = false;
++  int? _psm;
++  
++  // Test parameters
++  int _messageSize = 100; // bytes
++  int _messageCount = 100;
++  int _testDuration = 10; // seconds
++  
++  // Test results
++  TestResults? _l2capResults;
++  TestResults? _gattResults;
++  bool _testing = false;
++  String _currentTest = '';
++  
++  @override
++  void initState() {
++    super.initState();
++    _init();
++  }
++  
++  Future<void> _init() async {
++    // Initialize L2CAP service
++    await _l2capService.init();
++    
++    // Initialize GATT connection - we don't need services, just basic connection
++    try {
++      await widget.device.connect();
++      setState(() {
++        _gattConnected = true;
++      });
++    } catch (e) {
++      debugPrint('Error connecting to device: $e');
++    }
++    
++    // Read PSM from GATT and connect L2CAP
++    await _readPsmAndConnectL2cap();
++  }
++  
++  Future<void> _readPsmAndConnectL2cap() async {
++    try {
++      const psmUuid = '88776655-4433-2211-f0de-bc9a78563412';
++      
++      final services = await widget.device.discoverServices();
++      
++      for (final service in services) {
++        for (final char in service.characteristics) {
++          if (char.uuid.toString().toLowerCase() == psmUuid) {
++            final value = await char.read();
++            if (value.length >= 2) {
++              _psm = value[0] | (value[1] << 8);
++              
++              // Connect to L2CAP
++              final success = await _l2capService.connect(
++                widget.device.remoteId.toString(),
++                _psm!,
++              );
++              
++              setState(() {
++                _l2capConnected = success;
++              });
++              
++              return;
++            }
++          }
++        }
++      }
++    } catch (e) {
++      debugPrint('Error connecting L2CAP: $e');
++    }
++  }
++  
++  Future<void> _runThroughputTest(String protocol) async {
++    setState(() {
++      _testing = true;
++      _currentTest = '$protocol Throughput Test';
++    });
++    
++    final results = TestResults();
++    final stopwatch = Stopwatch()..start();
++    final random = Random();
++    
++    int messagesSent = 0;
++    int messagesReceived = 0;
++    int totalBytes = 0;
++    
++    // Generate test data - use same ASCII text payload for both protocols
++    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ';
++    final testMessage = List.generate(min(_messageSize, 200), (i) => chars[random.nextInt(chars.length)]).join();
++    
++    // Subscribe to responses if using L2CAP
++    StreamSubscription<String>? subscription;
++    BluetoothCharacteristic? testCharacteristic;
++    
++    if (protocol == 'L2CAP') {
++      subscription = _l2capService.messageStream.listen((message) {
++        if (message.startsWith('ECHO: ')) {
++          messagesReceived++;
++        }
++      });
++    } else if (protocol == 'GATT') {
++      // Find a writable characteristic for GATT testing (prefer writeWithoutResponse)
++      try {
++        final services = await widget.device.discoverServices();
++        BluetoothCharacteristic? fallbackChar;
++        
++        for (final service in services) {
++          for (final char in service.characteristics) {
++            if (char.properties.writeWithoutResponse) {
++              testCharacteristic = char;
++              break;
++            } else if (char.properties.write && fallbackChar == null) {
++              fallbackChar = char; // Keep as fallback
++            }
++          }
++          if (testCharacteristic != null) break;
++        }
++        
++        // Use fallback if no writeWithoutResponse found
++        testCharacteristic ??= fallbackChar;
++        
++        if (testCharacteristic != null) {
++          debugPrint('Using GATT characteristic: ${testCharacteristic.uuid} '
++                    '(writeWithoutResponse: ${testCharacteristic.properties.writeWithoutResponse}, '
++                    'write: ${testCharacteristic.properties.write})');
++        }
++      } catch (e) {
++        debugPrint('Error finding GATT test characteristic: $e');
++      }
++    }
++    
++    // Send messages for the test duration
++    while (stopwatch.elapsedMilliseconds < _testDuration * 1000 && messagesSent < _messageCount) {
++      try {
++        if (protocol == 'L2CAP' && _l2capConnected) {
++          await _l2capService.sendMessage(testMessage);
++        } else if (protocol == 'GATT' && _gattConnected && testCharacteristic != null) {
++          // Send same text data via GATT characteristic as UTF-8 bytes
++          final utf8Bytes = testMessage.codeUnits;
++          final data = utf8Bytes.take(min(_messageSize, 20)).toList(); // GATT has smaller MTU
++          try {
++            if (testCharacteristic.properties.writeWithoutResponse) {
++              await testCharacteristic.write(data, withoutResponse: true);
++            } else if (testCharacteristic.properties.write) {
++              await testCharacteristic.write(data, withoutResponse: false);
++            } else {
++              // Skip this characteristic if it doesn't support writes
++              continue;
++            }
++            messagesReceived++; // For GATT, count as received since operation succeeded
++          } catch (e) {
++            debugPrint('GATT write failed: $e');
++            // Continue trying other messages
++          }
++        }
++        
++        messagesSent++;
++        totalBytes += _messageSize;
++        
++        // Small delay to prevent overwhelming the connection
++        await Future.delayed(const Duration(milliseconds: 10));
++        
++      } catch (e) {
++        debugPrint('Error sending message: $e');
++        break;
++      }
++    }
++    
++    stopwatch.stop();
++    subscription?.cancel();
++    
++    // Wait a bit for remaining responses
++    await Future.delayed(const Duration(seconds: 1));
++    
++    results.messagesSent = messagesSent;
++    results.messagesReceived = messagesReceived;
++    results.totalBytes = totalBytes;
++    results.durationMs = stopwatch.elapsedMilliseconds;
++    results.throughputBytesPerSecond = (totalBytes * 1000) / stopwatch.elapsedMilliseconds;
++    results.throughputMessagesPerSecond = (messagesSent * 1000) / stopwatch.elapsedMilliseconds;
++    results.successRate = messagesReceived / messagesSent;
++    
++    setState(() {
++      if (protocol == 'L2CAP') {
++        _l2capResults = results;
++      } else {
++        _gattResults = results;
++      }
++      _testing = false;
++      _currentTest = '';
++    });
++  }
++  
++  Future<void> _runLatencyTest(String protocol) async {
++    setState(() {
++      _testing = true;
++      _currentTest = '$protocol Latency Test';
++    });
++    
++    final latencies = <int>[];
++    const testMessage = 'LATENCY_TEST';
++    
++    if (protocol == 'L2CAP' && _l2capConnected) {
++      // Subscribe to responses
++      late StreamSubscription<String> subscription;
++      final responseCompleter = Completer<void>();
++      
++      subscription = _l2capService.messageStream.listen((message) {
++        if (message.startsWith('ECHO: LATENCY_TEST')) {
++          responseCompleter.complete();
++        }
++      });
++      
++      // Run multiple latency tests
++      for (int i = 0; i < 10; i++) {
++        final stopwatch = Stopwatch()..start();
++        
++        await _l2capService.sendMessage(testMessage);
++        
++        try {
++          await responseCompleter.future.timeout(const Duration(seconds: 5));
++          stopwatch.stop();
++          latencies.add(stopwatch.elapsedMilliseconds);
++        } catch (e) {
++          debugPrint('Timeout waiting for response: $e');
++        }
++        
++        await Future.delayed(const Duration(milliseconds: 100));
++      }
++      
++      subscription.cancel();
++    }
++    
++    // Calculate latency statistics
++    if (latencies.isNotEmpty) {
++      latencies.sort();
++      final results = _l2capResults ?? TestResults();
++      results.minLatencyMs = latencies.first;
++      results.maxLatencyMs = latencies.last;
++      results.avgLatencyMs = latencies.reduce((a, b) => a + b) / latencies.length;
++      results.medianLatencyMs = latencies[latencies.length ~/ 2].toDouble();
++      
++      setState(() {
++        _l2capResults = results;
++      });
++    }
++    
++    setState(() {
++      _testing = false;
++      _currentTest = '';
++    });
++  }
++  
++  @override
++  void dispose() {
++    _l2capService.dispose();
++    super.dispose();
++  }
++  
++  @override
++  Widget build(BuildContext context) {
++    return Scaffold(
++      appBar: AppBar(
++        title: const Text('Performance Test'),
++      ),
++      body: SingleChildScrollView(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            // Connection Status
++            _buildConnectionStatus(),
++            const SizedBox(height: 20),
++            
++            // Test Parameters
++            _buildTestParameters(),
++            const SizedBox(height: 20),
++            
++            // Test Controls
++            _buildTestControls(),
++            const SizedBox(height: 20),
++            
++            // Test Results
++            _buildTestResults(),
++          ],
++        ),
++      ),
++    );
++  }
++  
++  Widget _buildConnectionStatus() {
++    return Card(
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            const Text('Connection Status', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
++            const SizedBox(height: 8),
++            Row(
++              children: [
++                Icon(
++                  _gattConnected ? Icons.check_circle : Icons.error,
++                  color: _gattConnected ? Colors.green : Colors.red,
++                ),
++                const SizedBox(width: 8),
++                Text('GATT: ${_gattConnected ? "Connected" : "Disconnected"}'),
++              ],
++            ),
++            const SizedBox(height: 4),
++            Row(
++              children: [
++                Icon(
++                  _l2capConnected ? Icons.check_circle : Icons.error,
++                  color: _l2capConnected ? Colors.green : Colors.red,
++                ),
++                const SizedBox(width: 8),
++                Text('L2CAP: ${_l2capConnected ? "Connected" : "Disconnected"}'),
++                if (_psm != null) Text(' (PSM: 0x${_psm!.toRadixString(16)})'),
++              ],
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++  
++  Widget _buildTestParameters() {
++    return Card(
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            const Text('Test Parameters', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
++            const SizedBox(height: 8),
++            Row(
++              children: [
++                const Text('Message Size: '),
++                SizedBox(
++                  width: 80,
++                  child: TextFormField(
++                    initialValue: _messageSize.toString(),
++                    keyboardType: TextInputType.number,
++                    onChanged: (value) {
++                      _messageSize = int.tryParse(value) ?? _messageSize;
++                    },
++                  ),
++                ),
++                const Text(' bytes'),
++              ],
++            ),
++            const SizedBox(height: 8),
++            Row(
++              children: [
++                const Text('Message Count: '),
++                SizedBox(
++                  width: 80,
++                  child: TextFormField(
++                    initialValue: _messageCount.toString(),
++                    keyboardType: TextInputType.number,
++                    onChanged: (value) {
++                      _messageCount = int.tryParse(value) ?? _messageCount;
++                    },
++                  ),
++                ),
++              ],
++            ),
++            const SizedBox(height: 8),
++            Row(
++              children: [
++                const Text('Test Duration: '),
++                SizedBox(
++                  width: 80,
++                  child: TextFormField(
++                    initialValue: _testDuration.toString(),
++                    keyboardType: TextInputType.number,
++                    onChanged: (value) {
++                      _testDuration = int.tryParse(value) ?? _testDuration;
++                    },
++                  ),
++                ),
++                const Text(' seconds'),
++              ],
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++  
++  Widget _buildTestControls() {
++    return Card(
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            const Text('Test Controls', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
++            const SizedBox(height: 8),
++            if (_testing) 
++              Text('Running: $_currentTest', style: const TextStyle(fontStyle: FontStyle.italic)),
++            const SizedBox(height: 8),
++            Wrap(
++              spacing: 8,
++              children: [
++                ElevatedButton(
++                  onPressed: _testing || !_l2capConnected ? null : () => _runThroughputTest('L2CAP'),
++                  child: const Text('L2CAP Throughput'),
++                ),
++                ElevatedButton(
++                  onPressed: _testing || !_l2capConnected ? null : () => _runLatencyTest('L2CAP'),
++                  child: const Text('L2CAP Latency'),
++                ),
++                ElevatedButton(
++                  onPressed: _testing || !_gattConnected ? null : () => _runThroughputTest('GATT'),
++                  child: const Text('GATT Throughput'),
++                ),
++                ElevatedButton(
++                  onPressed: _testing ? null : () {
++                    setState(() {
++                      _l2capResults = null;
++                      _gattResults = null;
++                    });
++                  },
++                  child: const Text('Clear Results'),
++                ),
++              ],
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++  
++  Widget _buildTestResults() {
++    return Card(
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            const Text('Test Results', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
++            const SizedBox(height: 8),
++            IntrinsicHeight(
++              child: Row(
++                crossAxisAlignment: CrossAxisAlignment.start,
++                children: [
++                  Expanded(child: _buildResultColumn('L2CAP', _l2capResults)),
++                  const SizedBox(width: 16),
++                  Expanded(child: _buildResultColumn('GATT', _gattResults)),
++                ],
++              ),
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++  
++  Widget _buildResultColumn(String title, TestResults? results) {
++    return Column(
++      crossAxisAlignment: CrossAxisAlignment.start,
++      children: [
++        Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
++        const SizedBox(height: 8),
++        if (results != null) ...[
++          Text('Messages Sent: ${results.messagesSent}'),
++          Text('Messages Received: ${results.messagesReceived}'),
++          Text('Success Rate: ${(results.successRate * 100).toStringAsFixed(1)}%'),
++          Text('Duration: ${results.durationMs}ms'),
++          Text('Throughput: ${results.throughputBytesPerSecond.toStringAsFixed(0)} B/s'),
++          Text('Message Rate: ${results.throughputMessagesPerSecond.toStringAsFixed(1)} msg/s'),
++          if (results.avgLatencyMs != null) ...[
++            const SizedBox(height: 8),
++            Text('Min Latency: ${results.minLatencyMs}ms'),
++            Text('Max Latency: ${results.maxLatencyMs}ms'),
++            Text('Avg Latency: ${results.avgLatencyMs!.toStringAsFixed(1)}ms'),
++            Text('Median Latency: ${results.medianLatencyMs!.toStringAsFixed(1)}ms'),
++          ],
++        ] else ...[
++          const Text('No results yet'),
++        ],
++      ],
++    );
++  }
++}
++
++class TestResults {
++  int messagesSent = 0;
++  int messagesReceived = 0;
++  int totalBytes = 0;
++  int durationMs = 0;
++  double throughputBytesPerSecond = 0;
++  double throughputMessagesPerSecond = 0;
++  double successRate = 0;
++  
++  // Latency metrics
++  int? minLatencyMs;
++  int? maxLatencyMs;
++  double? avgLatencyMs;
++  double? medianLatencyMs;
++}
+\ No newline at end of file
+diff --git a/lib/services/audio_player_service_gatt.dart b/lib/services/audio_player_service_gatt.dart
+new file mode 100644
+index 0000000..1ac2e41
+--- /dev/null
++++ b/lib/services/audio_player_service_gatt.dart
+@@ -0,0 +1,80 @@
++// lib/services/audio_stream_service.dart
++
++import 'dart:async';
++import 'dart:typed_data';
++import 'package:flutter/foundation.dart';
++import 'package:flutter_blue_plus/flutter_blue_plus.dart';
++
++/// Your 128-bit UUID for the audio-WAV characteristic:
++const String audioCharUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
++
++/// Buffers precisely one WAV file from the device:
++///  • fires `onData` for every chunk (so your UI can update progress)
++///  • fires `onDone` once the full file is in.
++///  • stays subscribed so when you `reset()` it will pick up the next file.
++class AudioStreamService {
++  final BluetoothDevice device;
++
++  /// Called on every incoming chunk (for UI progress).
++  final VoidCallback? onData;
++
++  /// Called once, the moment we have the full WAV buffer.
++  final VoidCallback? onDone;
++
++  StreamSubscription<List<int>>? _sub;
++  final List<int> audioBuffer = [];
++  int? expectedLength;
++
++  AudioStreamService(this.device, {this.onData, this.onDone});
++
++  Future<void> init() async {
++    // 1) connect (ignore if already)
++    try {
++      await device.connect(autoConnect: false);
++    } catch (_) {}
++
++    // 2) discover & hook up
++    final svcs = await device.discoverServices();
++    for (var svc in svcs) {
++      for (var chr in svc.characteristics) {
++        if (chr.uuid.toString().toLowerCase() == audioCharUuid
++            && (chr.properties.notify || chr.properties.indicate)) {
++          await chr.setNotifyValue(true);
++          _sub = chr.lastValueStream.listen(_handleChunk);
++          return;
++        }
++      }
++    }
++    throw Exception('Audio characteristic $audioCharUuid not found');
++  }
++
++  void _handleChunk(List<int> bytes) {
++    audioBuffer.addAll(bytes);
++    // parse header once we have 44 bytes
++    if (expectedLength == null && audioBuffer.length >= 44) {
++      final header = Uint8List.fromList(audioBuffer.sublist(40, 44));
++      expectedLength =
++          44 + ByteData.sublistView(header).getUint32(0, Endian.little);
++    }
++    onData?.call();
++
++    // once full file arrived…
++    if (expectedLength != null && audioBuffer.length >= expectedLength!) {
++      onDone?.call();
++    }
++  }
++
++  /// Clear out the old WAV so the *next* one starts fresh.
++  void reset() {
++    audioBuffer.clear();
++    expectedLength = null;
++    onData?.call();
++  }
++
++  void dispose() {
++    _sub?.cancel();
++    try {
++      device.disconnect();
++    } catch (_) {}
++  }
++}
+diff --git a/lib/services/l2cap_service.dart b/lib/services/l2cap_service.dart
+new file mode 100644
+index 0000000..32592cc
+--- /dev/null
++++ b/lib/services/l2cap_service.dart
+@@ -0,0 +1,142 @@
++// lib/services/l2cap_service.dart
++
++import 'dart:async';
++import 'dart:typed_data';
++import 'package:flutter/services.dart';
++import 'package:flutter/foundation.dart';
++
++class L2capService {
++  static const MethodChannel _channel = MethodChannel('jarvis_app/l2cap');
++  static const EventChannel _eventChannel = EventChannel('jarvis_app/l2cap_events');
++  
++  StreamController<String>? _messageController;
++  StreamSubscription? _eventSubscription;
++  
++  bool _connected = false;
++  String? _deviceAddress;
++  int? _psm;
++  
++  bool get connected => _connected;
++  
++  /// Initialize the L2CAP service
++  Future<void> init() async {
++    debugPrint('🔌 [L2capService] Initializing...');
++    
++    // Set up event channel for incoming messages
++    _messageController = StreamController<String>.broadcast();
++    _eventSubscription = _eventChannel.receiveBroadcastStream().listen(
++      (dynamic event) {
++        if (event is Map) {
++          final type = event['type'];
++          final data = event['data'];
++          
++          switch (type) {
++            case 'message':
++              debugPrint('📨 [L2CAP] Received: $data');
++              _messageController?.add(data as String);
++              break;
++            case 'connected':
++              _connected = true;
++              debugPrint('✅ [L2CAP] Connected');
++              break;
++            case 'disconnected':
++              _connected = false;
++              debugPrint('❌ [L2CAP] Disconnected');
++              break;
++            case 'error':
++              debugPrint('⚠️ [L2CAP] Error: $data');
++              break;
++          }
++        }
++      },
++      onError: (error) {
++        debugPrint('❌ [L2CAP] Stream error: $error');
++      },
++    );
++  }
++  
++  /// Connect to L2CAP channel
++  Future<bool> connect(String deviceAddress, int psm) async {
++    try {
++      debugPrint('🔗 [L2CAP] Connecting to $deviceAddress PSM: $psm');
++      
++      _deviceAddress = deviceAddress;
++      _psm = psm;
++      
++      final result = await _channel.invokeMethod<bool>('connect', {
++        'address': deviceAddress,
++        'psm': psm,
++      });
++      
++      _connected = result ?? false;
++      return _connected;
++    } catch (e) {
++      debugPrint('❌ [L2CAP] Connect error: $e');
++      return false;
++    }
++  }
++  
++  /// Send text message over L2CAP
++  Future<bool> sendMessage(String message) async {
++    if (!_connected) {
++      debugPrint('⚠️ [L2CAP] Not connected');
++      return false;
++    }
++    
++    try {
++      debugPrint('📤 [L2CAP] Sending: $message');
++      
++      final result = await _channel.invokeMethod<bool>('sendMessage', {
++        'message': message,
++      });
++      
++      return result ?? false;
++    } catch (e) {
++      debugPrint('❌ [L2CAP] Send error: $e');
++      return false;
++    }
++  }
++  
++  /// Send raw bytes over L2CAP
++  Future<bool> sendBytes(Uint8List data) async {
++    if (!_connected) {
++      debugPrint('⚠️ [L2CAP] Not connected');
++      return false;
++    }
++    
++    try {
++      debugPrint('📤 [L2CAP] Sending ${data.length} bytes');
++      
++      final result = await _channel.invokeMethod<bool>('sendBytes', {
++        'data': data,
++      });
++      
++      return result ?? false;
++    } catch (e) {
++      debugPrint('❌ [L2CAP] Send bytes error: $e');
++      return false;
++    }
++  }
++  
++  /// Get message stream
++  Stream<String> get messageStream => _messageController?.stream ?? const Stream.empty();
++  
++  /// Disconnect L2CAP channel
++  Future<void> disconnect() async {
++    try {
++      await _channel.invokeMethod('disconnect');
++      _connected = false;
++      _deviceAddress = null;
++      _psm = null;
++    } catch (e) {
++      debugPrint('❌ [L2CAP] Disconnect error: $e');
++    }
++  }
++  
++  /// Dispose resources
++  void dispose() {
++    _eventSubscription?.cancel();
++    _messageController?.close();
++    disconnect();
++  }
++}
+\ No newline at end of file
