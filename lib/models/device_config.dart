@@ -5,6 +5,7 @@ class DeviceConfig {
   bool sendDebugDrops = false;
   bool playOnDevice = true;
   int ledBrightness = 0;
+  bool l2capStreaming = false;
 
   late ConfigService _service;
 
@@ -34,6 +35,9 @@ class DeviceConfig {
       case 0x04:
         if (len >= 1) playOnDevice = data[0] != 0;
         break;
+      case 0x05:
+        if (len >= 1) l2capStreaming = data[0] != 0;
+        break;
       default:
         break;
     }
@@ -61,5 +65,11 @@ class DeviceConfig {
     ledBrightness = value.clamp(0, 65535);
     _service.sendConfigUpdate(0x03, [value & 0xFF, (value >> 8) & 0xFF]);
     debugPrint('🛠️ LED Brightness set to $ledBrightness');
+  }
+
+  void setL2capStreaming(bool enabled) {
+    l2capStreaming = enabled;
+    _service.sendConfigUpdate(0x05, [enabled ? 1 : 0]);
+    debugPrint('🛠️ L2CAP Streaming set to $enabled');
   }
 }

@@ -107,6 +107,13 @@ class L2capService {
     try {
       debugPrint('📤 [L2CAP] Sending ${data.length} bytes');
       
+      // Add defensive check for corrupted data
+      if (data.length > 65535) {
+        debugPrint('❌ [L2CAP] ERROR: Data size ${data.length} is unreasonably large!');
+        debugPrint('❌ [L2CAP] First 10 bytes: ${data.take(10).toList()}');
+        return false;
+      }
+      
       final result = await _channel.invokeMethod<bool>('sendBytes', {
         'data': data,
       });

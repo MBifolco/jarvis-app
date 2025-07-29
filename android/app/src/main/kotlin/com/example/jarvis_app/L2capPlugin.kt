@@ -240,6 +240,20 @@ class L2capPlugin(private val flutterEngine: FlutterEngine) :
         return withContext(Dispatchers.IO) {
             try {
                 Log.d(TAG, "Sending ${data.size} bytes of data")
+                
+                // L2CAP should handle chunking, but let's be defensive
+                // If data is larger than expected, log a warning
+                if (data.size > 1024) {
+                    Log.w(TAG, "WARNING: Attempting to send ${data.size} bytes, which exceeds typical L2CAP MTU")
+                }
+                
+                // Add validation to prevent sending corrupted data
+                if (data.size > 65535) {
+                    Log.e(TAG, "ERROR: Data size ${data.size} is unreasonably large, rejecting")
+                    sendEvent("error", "Data size ${data.size} exceeds maximum (65535 bytes)")
+                    return@withContext false
+                }
+                
                 outputStream?.write(data)
                 outputStream?.flush()
                 Log.d(TAG, "Bytes sent successfully")

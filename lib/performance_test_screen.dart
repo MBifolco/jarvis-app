@@ -3,6 +3,8 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'services/l2cap_service.dart';
+import 'services/config_service.dart';
+import 'models/device_config.dart';
 
 class PerformanceTestScreen extends StatefulWidget {
   final BluetoothDevice device;
@@ -18,6 +20,7 @@ class PerformanceTestScreen extends StatefulWidget {
 
 class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
   final L2capService _l2capService = L2capService();
+  ConfigService? _configService;
   
   bool _connected = false;
   int? _psm;
@@ -27,6 +30,7 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
   int _packetSize = 512;
   int _packetCount = 100;
   int _testDuration = 10; // seconds
+  bool _streamingMode = true;  // Default to streaming mode
   
   // L2CAP MTU limit (from ESP32 implementation)
   static const int _maxPacketSize = 512;
@@ -52,6 +56,11 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
   
   Future<void> _init() async {
     await _l2capService.init();
+    
+    // Initialize config service
+    _configService = ConfigService(widget.device);
+    final services = await widget.device.discoverServices();
+    await _configService!.initWithServices(services);
     
     // Subscribe to incoming messages for throughput measurement
     _messageSubscription = _l2capService.messageStream.listen((message) {
@@ -155,6 +164,14 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
   Future<void> _startThroughputTest() async {
     if (!_connected) return;
     
+    if (_streamingMode) {
+      await _startStreamingThroughputTest();
+    } else {
+      await _startEchoThroughputTest();
+    }
+  }
+  
+  Future<void> _startEchoThroughputTest() async {
     if (mounted) {
       setState(() {
         _testing = true;
@@ -162,9 +179,13 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
     }
     
     _resetResults();
-    _addLog('Starting throughput test');
+    _addLog('Starting echo-based throughput test');
     _addLog('Packet size: $_packetSize bytes');
     _addLog('Duration: $_testDuration seconds');
+    
+    // Switch ESP32 to echo mode via config
+    _configService?.config.setL2capStreaming(false);
+    await Future.delayed(const Duration(milliseconds: 100)); // Let mode switch settle
     
     _stopwatch.reset();
     _stopwatch.start();
@@ -197,6 +218,53 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
     });
   }
   
+  Future<void> _startStreamingThroughputTest() async {
+    if (mounted) {
+      setState(() {
+        _testing = true;
+      });
+    }
+    
+    _resetResults();
+    _addLog('Starting streaming throughput test');
+    _addLog('Packet size: $_packetSize bytes');
+    _addLog('Duration: $_testDuration seconds');
+    
+    // Switch ESP32 to streaming mode via config
+    _configService?.config.setL2capStreaming(true);
+    await Future.delayed(const Duration(milliseconds: 100)); // Let mode switch settle
+    
+    _stopwatch.reset();
+    _stopwatch.start();
+    
+    // Create test data
+    final actualPacketSize = _packetSize > _maxPacketSize ? _maxPacketSize : _packetSize;
+    if (_packetSize > _maxPacketSize) {
+      _addLog('Warning: Packet size limited to $_maxPacketSize bytes (L2CAP MTU)');
+    }
+    
+    final testData = Uint8List(actualPacketSize);
+    for (int i = 0; i < testData.length; i++) {
+      testData[i] = i % 256;
+    }
+    
+    // Send packets at a more realistic rate for L2CAP
+    _testTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) async {
+      if (_stopwatch.elapsedMilliseconds >= _testDuration * 1000) {
+        await _stopStreamingThroughputTest();
+        return;
+      }
+      
+      // Send packet (no echo expected)
+      final success = await _l2capService.sendBytes(testData);
+      if (success && mounted) {
+        _packetsSent++;
+        _bytesSent += testData.length;
+        setState(() {});
+      }
+    });
+  }
+  
   void _stopThroughputTest() {
     _testTimer?.cancel();
     _stopwatch.stop();
@@ -219,6 +287,72 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
     _addLog('Sent throughput: ${sentMbps.toStringAsFixed(2)} Mbps');
     _addLog('Received throughput: ${receivedMbps.toStringAsFixed(2)} Mbps');
     _addLog('Packet loss: ${((_packetsSent - _packetsReceived) / _packetsSent * 100).toStringAsFixed(1)}%');
+  }
+  
+  Future<void> _stopStreamingThroughputTest() async {
+    _testTimer?.cancel();
+    _stopwatch.stop();
+    
+    // Switch back to echo mode
+    _configService?.config.setL2capStreaming(false);
+    
+    if (mounted) {
+      setState(() {
+        _testing = false;
+        _testTime = _stopwatch.elapsed;
+      });
+    }
+    
+    // Query ESP32 for actual received packet count
+    _addLog('Querying ESP32 for received packet count...');
+    
+    // Set up listener for status response first
+    late StreamSubscription subscription;
+    final completer = Completer<void>();
+    
+    subscription = _l2capService.messageStream.listen((message) {
+      if (message.startsWith('STATUS:')) {
+        final parts = message.substring(7).split(',');
+        if (parts.length >= 2) {
+          final actualPacketsReceived = int.tryParse(parts[0]) ?? 0;
+          final actualBytesReceived = int.tryParse(parts[1]) ?? 0;
+          
+          _packetsReceived = actualPacketsReceived;
+          _bytesReceived = actualBytesReceived;
+          
+          subscription.cancel();
+          completer.complete();
+        }
+      }
+    });
+    
+    // Send status query
+    await _l2capService.sendMessage('STATUS?');
+    
+    // Wait for response with timeout
+    try {
+      await completer.future.timeout(const Duration(seconds: 2));
+    } catch (e) {
+      _addLog('Timeout waiting for status response');
+      subscription.cancel();
+    }
+    
+    // Calculate and display results
+    final seconds = _testTime.inMilliseconds / 1000.0;
+    final sentMbps = (_bytesSent * 8) / (seconds * 1000000.0);
+    final receivedMbps = (_bytesReceived * 8) / (seconds * 1000000.0);
+    
+    _addLog('Streaming test completed');
+    _addLog('Duration: ${seconds.toStringAsFixed(2)}s');
+    _addLog('Packets sent: $_packetsSent');
+    _addLog('Packets received by ESP32: $_packetsReceived');
+    _addLog('Sent throughput: ${sentMbps.toStringAsFixed(2)} Mbps');
+    _addLog('Received throughput: ${receivedMbps.toStringAsFixed(2)} Mbps');
+    _addLog('Packet loss: ${((_packetsSent - _packetsReceived) / _packetsSent * 100).toStringAsFixed(1)}%');
+    
+    if (mounted) {
+      setState(() {});
+    }
   }
   
   Future<void> _startLatencyTest() async {
@@ -298,6 +432,7 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
     _testTimer?.cancel();
     _messageSubscription?.cancel();
     _l2capService.dispose();
+    _configService?.dispose();
     super.dispose();
   }
   
@@ -396,6 +531,31 @@ class _PerformanceTestScreenState extends State<PerformanceTestScreen> {
               controller: TextEditingController(text: _packetCount.toString()),
               onChanged: (value) => _packetCount = int.tryParse(value) ?? 100,
               enabled: !_testing,
+            ),
+            
+            const SizedBox(height: 16),
+            
+            // Streaming mode toggle
+            Row(
+              children: [
+                Switch(
+                  value: _streamingMode,
+                  onChanged: _testing ? null : (value) {
+                    setState(() {
+                      _streamingMode = value;
+                    });
+                  },
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _streamingMode 
+                        ? 'Streaming Mode: Faster transmission, no echo responses'
+                        : 'Echo Mode: Traditional ping-pong testing',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ),
+              ],
             ),
             
             const SizedBox(height: 16),
