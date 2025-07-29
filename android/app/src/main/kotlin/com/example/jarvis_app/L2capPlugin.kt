@@ -127,18 +127,44 @@ class L2capPlugin(private val flutterEngine: FlutterEngine) :
                 
                 // Create L2CAP socket
                 l2capSocket = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    Log.d(TAG, "Creating L2CAP channel using createInsecureL2capChannel()")
                     device.createInsecureL2capChannel(psm)
                 } else {
                     // For older Android versions, we'd need reflection or alternative approach
                     throw IOException("L2CAP requires Android Q (API 29) or higher")
                 }
                 
+                Log.d(TAG, "L2CAP socket created, attempting connection...")
+                
                 // Connect to the socket
                 l2capSocket?.connect()
+                
+                Log.d(TAG, "L2CAP socket connected, getting streams...")
                 
                 // Get streams
                 inputStream = l2capSocket?.inputStream
                 outputStream = l2capSocket?.outputStream
+                
+                // Log connection details if available
+                l2capSocket?.let { socket ->
+                    try {
+                        // Try to get MTU or other connection info
+                        Log.d(TAG, "L2CAP socket state: isConnected=${socket.isConnected}")
+                        Log.d(TAG, "L2CAP input stream available: ${inputStream != null}")
+                        Log.d(TAG, "L2CAP output stream available: ${outputStream != null}")
+                        
+                        // Try to get maximum transmission unit if available via reflection
+                        try {
+                            val mtuMethod = socket.javaClass.getMethod("getMaxTransmissionUnit")
+                            val mtu = mtuMethod.invoke(socket) as? Int
+                            Log.d(TAG, "L2CAP MTU: $mtu")
+                        } catch (e: Exception) {
+                            Log.d(TAG, "Could not get L2CAP MTU via reflection: ${e.message}")
+                        }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "Error getting socket details: ${e.message}")
+                    }
+                }
                 
                 // Start reading thread
                 startReading()
@@ -162,22 +188,30 @@ class L2capPlugin(private val flutterEngine: FlutterEngine) :
         readingJob = coroutineScope.launch {
             val buffer = ByteArray(1024)
             
+            Log.d(TAG, "Starting L2CAP read loop with buffer size ${buffer.size}")
+            
             try {
                 while (isActive && l2capSocket?.isConnected == true) {
                     val bytesRead = inputStream?.read(buffer) ?: -1
                     
                     if (bytesRead > 0) {
+                        Log.d(TAG, "Read $bytesRead bytes from L2CAP")
                         val message = String(buffer, 0, bytesRead, Charsets.UTF_8)
-                        Log.d(TAG, "Received: $message")
+                        Log.d(TAG, "Received message: '$message'")
                         sendEvent("message", message)
                     } else if (bytesRead == -1) {
+                        Log.d(TAG, "End of stream reached, exiting read loop")
                         break // End of stream
+                    } else if (bytesRead == 0) {
+                        Log.d(TAG, "Read 0 bytes, continuing...")
                     }
                 }
             } catch (e: IOException) {
                 Log.e(TAG, "Error reading from L2CAP", e)
                 sendEvent("error", "Read error: ${e.message}")
             }
+            
+            Log.d(TAG, "L2CAP read loop terminated")
             
             withContext(Dispatchers.Main) {
                 disconnect()
@@ -189,9 +223,10 @@ class L2capPlugin(private val flutterEngine: FlutterEngine) :
         return withContext(Dispatchers.IO) {
             try {
                 val bytes = message.toByteArray(Charsets.UTF_8)
+                Log.d(TAG, "Sending message: '$message' (${bytes.size} bytes)")
                 outputStream?.write(bytes)
                 outputStream?.flush()
-                Log.d(TAG, "Sent: $message")
+                Log.d(TAG, "Message sent successfully")
                 true
             } catch (e: IOException) {
                 Log.e(TAG, "Error sending message", e)
@@ -204,9 +239,10 @@ class L2capPlugin(private val flutterEngine: FlutterEngine) :
     private suspend fun sendBytes(data: ByteArray): Boolean {
         return withContext(Dispatchers.IO) {
             try {
+                Log.d(TAG, "Sending ${data.size} bytes of data")
                 outputStream?.write(data)
                 outputStream?.flush()
-                Log.d(TAG, "Sent ${data.size} bytes")
+                Log.d(TAG, "Bytes sent successfully")
                 true
             } catch (e: IOException) {
                 Log.e(TAG, "Error sending bytes", e)
