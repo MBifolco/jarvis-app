@@ -5,11 +5,13 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:openai_realtime_dart/openai_realtime_dart.dart';
 import 'audio_player_service.dart';
+import 'transcript_service.dart';
 
 class RealtimeService {
   final RealtimeClient _client;
   final AudioPlayerService _player;
   final void Function(Uint8List wav)? onAudio;
+  final TranscriptService? transcriptService;
   bool _connected = false;
   
   // Buffer for accumulating small streaming chunks
@@ -20,6 +22,7 @@ class RealtimeService {
   RealtimeService(
     String apiKey, {
     this.onAudio,
+    this.transcriptService,
   }) : 
     _client = RealtimeClient(apiKey: apiKey),
     _player = AudioPlayerService();
@@ -45,6 +48,11 @@ class RealtimeService {
       
       debugPrint('🗣 partial transcript: "${transcript ?? ''}"');
       
+      // Update transcript with partial response
+      if (transcript != null && transcript.isNotEmpty && transcriptService != null) {
+        transcriptService!.addPartialAssistantMessage(transcript);
+      }
+      
       // Accumulate small audio chunks before sending
       if (audioData != null && audioData.isNotEmpty) {
         final pcmBytes = audioData.cast<int>();
@@ -60,9 +68,13 @@ class RealtimeService {
 
     _client.on(RealtimeEventType.conversationItemCompleted, (evt) {
       final wrapper = (evt as RealtimeEventConversationItemCompleted).item;
-      final msg        = wrapper.item as ItemMessage;
       final transcript = wrapper.formatted?.transcript ?? '';
       debugPrint('✅ completed response: "$transcript"');
+      
+      // Finalize transcript with completed response
+      if (transcript.isNotEmpty && transcriptService != null) {
+        transcriptService!.finalizeAssistantMessage(transcript);
+      }
       
       // Force flush any remaining audio buffer, even if transmitting
       if (_audioBuffer.isNotEmpty) {
@@ -76,11 +88,16 @@ class RealtimeService {
     debugPrint('🔗 connected');
   }
 
-  Future<void> sendAudio(Uint8List wavBytes) async {
+  Future<void> sendAudio(Uint8List wavBytes, {String? userTranscript}) async {
     if (!_connected) throw StateError('RealtimeService not initialized');
     
     // Clean up any remaining audio from previous response
     await _cleanupPreviousResponse();
+    
+    // Add user message to transcript if provided
+    if (userTranscript != null && userTranscript.isNotEmpty && transcriptService != null) {
+      transcriptService!.addUserMessage(userTranscript);
+    }
     
     final b64 = base64Encode(wavBytes);
     debugPrint('🎵 sendAudio: rawBytes=${wavBytes.length}, b64Chars=${b64.length}');

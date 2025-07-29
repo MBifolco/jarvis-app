@@ -9,6 +9,9 @@ import 'services/audio_stream_service.dart';
 import 'services/realtime_service.dart';
 import 'services/audio_player_service.dart';
 import 'services/config_service.dart';
+import 'services/transcript_service.dart';
+import 'services/whisper_service.dart';
+import 'widgets/transcript_widget.dart';
 import '../models/device_config.dart';
 
 class DeviceScreen extends StatefulWidget {
@@ -30,6 +33,8 @@ class _DeviceScreenState extends State<DeviceScreen> {
   late final AudioPlayerService _playerSvc;
   late final RealtimeService _realtimeSvc;
   late final ConfigService _configSvc;
+  late final TranscriptService _transcriptSvc;
+  late final WhisperService _whisperSvc;
   DeviceConfig get _config => _configSvc.config;
 
   bool _connected     = false;
@@ -40,11 +45,14 @@ class _DeviceScreenState extends State<DeviceScreen> {
   void initState() {
     super.initState();
     _playerSvc = AudioPlayerService();
+    _transcriptSvc = TranscriptService();
+    _whisperSvc = WhisperService(widget.openaiApiKey);
 
     // onAudio will be called for each TTS WAV
     _realtimeSvc = RealtimeService(
       widget.openaiApiKey,
       onAudio: _handleTtsAudio,
+      transcriptService: _transcriptSvc,
     );
 
 
@@ -81,6 +89,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
     _playerSvc.dispose();
     _realtimeSvc.dispose();
     _configSvc.dispose();
+    _transcriptSvc.dispose();
     super.dispose();
   }
 
@@ -106,20 +115,58 @@ class _DeviceScreenState extends State<DeviceScreen> {
     });
 
     final wav = _streamSvc.getPcmWav();
+    
+    // Add placeholder user message immediately
+    final placeholderMessageId = _transcriptSvc.addPlaceholderUserMessage();
+    
     try {
-      await _realtimeSvc.sendAudio(wav);
+      // Send to Realtime API immediately (don't wait for transcription)
+      final realtimeTask = _realtimeSvc.sendAudio(wav);
+      
+      // Start Whisper transcription async (don't block the conversation)
+      final transcriptionTask = _transcribeUserAudio(wav, placeholderMessageId);
+      
+      // Wait for realtime API to complete
+      await realtimeTask;
+      
       setState(() {
-        _statusMessage = '⏳ Awaiting TTS reply…';
+        _statusMessage = '⏳ Awaiting assistant reply…';
       });
+      
+      // Let transcription continue in background
+      transcriptionTask.catchError((e) {
+        // If transcription fails, update placeholder with error
+        if (mounted) {
+          _transcriptSvc.updateUserMessage(placeholderMessageId, "❌ Transcription failed");
+        }
+      });
+      
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text('Error: $e')));
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Error: $e')));
+      }
       setState(() {
         _statusMessage = '⚠️ Error: $e';
       });
+      // Update placeholder with error
+      _transcriptSvc.updateUserMessage(placeholderMessageId, "❌ Error sending audio");
     } finally {
       _streamSvc.reset();
       _isSending = false;
+    }
+  }
+
+  Future<void> _transcribeUserAudio(Uint8List wav, String messageId) async {
+    try {
+      final userTranscript = await _whisperSvc.transcribe(wav);
+      if (mounted) {
+        _transcriptSvc.updateUserMessage(messageId, userTranscript);
+      }
+    } catch (e) {
+      if (mounted) {
+        _transcriptSvc.updateUserMessage(messageId, "❌ Transcription failed");
+      }
     }
   }
 
@@ -166,6 +213,8 @@ class _DeviceScreenState extends State<DeviceScreen> {
               title: const Text('LED Brightness'),
               subtitle: Text('${_config.ledBrightness}'),
             ),
+            const SizedBox(height: 16),
+            TranscriptWidget(transcriptService: _transcriptSvc),
             const Spacer(),
             ElevatedButton.icon(
               onPressed: (_isSending || !_connected || bufLen == 0)
