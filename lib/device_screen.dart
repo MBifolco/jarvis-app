@@ -12,6 +12,7 @@ import 'services/config_service.dart';
 import 'services/transcript_service.dart';
 import 'services/whisper_service.dart';
 import 'widgets/transcript_widget.dart';
+import 'l2cap_test_screen.dart';
 import '../models/device_config.dart';
 
 class DeviceScreen extends StatefulWidget {
@@ -216,12 +217,29 @@ class _DeviceScreenState extends State<DeviceScreen> {
             const SizedBox(height: 16),
             TranscriptWidget(transcriptService: _transcriptSvc),
             const Spacer(),
-            ElevatedButton.icon(
-              onPressed: (_isSending || !_connected || bufLen == 0)
-                ? null
-                : _startProcessing,
-              icon: const Icon(Icons.send),
-              label: Text(_isSending ? 'Working…' : 'Send to OpenAI'),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _connected ? () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => L2capTestScreen(device: widget.device),
+                      ),
+                    );
+                  } : null,
+                  icon: const Icon(Icons.chat),
+                  label: const Text('L2CAP Test'),
+                ),
+                ElevatedButton.icon(
+                  onPressed: (_isSending || !_connected || bufLen == 0)
+                    ? null
+                    : _startProcessing,
+                  icon: const Icon(Icons.send),
+                  label: Text(_isSending ? 'Working…' : 'Send to OpenAI'),
+                ),
+              ],
             ),
           ],
         ),
