@@ -1,142 +1,118 @@
-// ignore_for_file: avoid_print, public_member_api_docs
+// lib/main.dart
 import 'dart:async';
-import 'package:blev/ble.dart';
-import 'package:blev/ble_central.dart';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'dart:typed_data';
-import 'dart:convert';
-List<String> lines = [];
 
-void main() {
-  runZoned(
-    () {
-      WidgetsFlutterBinding.ensureInitialized();
-      Permission.bluetoothScan.request().then((_) =>
-          Permission.bluetoothConnect.request()).then((_) {
-        BleCentral.create().then((ble) {
-          final stateStream = ble.getState();
-          late StreamSubscription<AdapterState> streamSub;
-          streamSub = stateStream.listen((state) {
-            if (state == AdapterState.poweredOn) {
-              streamSub.cancel();
-              scanAndConnectToJarvis(ble);
-            }
-          });
-        }).catchError((error) {
-          print('error requesting bluetooth permissions: $error');
-        });
-      });
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'device_screen.dart';
 
-      runApp(const MyApp());
-    },
-    zoneSpecification: ZoneSpecification(
-      print: (self, parent, zone, line) async {
-        if (lines.length > 30) {
-          lines.removeAt(0);
-        }
-        lines.add('${DateTime.now()}: $line');
-        parent.print(zone, line);
-      },
-    ),
-  );
+Future<void> main() async {
+  await dotenv.load(fileName: "p.env");
+  runApp(const MyApp());
 }
-
-Future<void> scanAndConnectToJarvis(BleCentral ble) async {
-  const int jarvisPsm = 0x0040;
-
-  print('Scanning for Jarvis device...');
-
-  ble.scanForPeripherals([]).listen(
-    (periphInfo) async {
-      final name = periphInfo.name ?? '';
-      final id = periphInfo.id;
-
-      if (!name.toLowerCase().contains('jarvis')) return;
-
-      print('🟢 Found Jarvis device: $name [$id]');
-      //await ble.stopScan();
-
-      try {
-        final periph = await ble.connectToPeripheral(id);
-        print('✅ Connected to Jarvis');
-
-        final chan = await periph.connectToL2CapChannel(jarvisPsm);
-        print('📡 L2CAP channel opened on PSM $jarvisPsm');
-
-        const message = 'Hello from Flutter';
-        await chan.write(Uint8List.fromList(message.codeUnits));
-        print('✉️ Sent: $message');
-
-        final response = await chan.read(256);
-        if (response == null) {
-          print('⚠️ No response from device');
-        } else {
-          print('📥 Received: ${utf8.decode(response)}');
-        }
-
-        await chan.close();
-        print('✅ Channel closed');
-        await periph.disconnect();
-        print('🔌 Disconnected');
-
-      } catch (e) {
-        print('❌ Error during connect or L2CAP exchange: $e');
-      }
-    },
-    onError: (e) => print('Scan error: $e'),
-  );
-}
-
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
-      title: 'Flutter BLE Scanner',
-      home: MyHomePage(title: 'BLE Scanner'),
+    return MaterialApp(
+      title: 'Jarvis Connector',
+      theme: ThemeData(useMaterial3: true, colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple)),
+      home: const ScanPage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-  final String title;
-
+class ScanPage extends StatefulWidget {
+  const ScanPage({super.key});
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<ScanPage> createState() => _ScanPageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  _MyHomePageState() {
-    loadData();
-  }
+class _ScanPageState extends State<ScanPage> {
+  final List<BluetoothDevice> _devices = [];
+  StreamSubscription<List<ScanResult>>? _scanSub;
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
-      ),
-      body: ListView.builder(
-        itemCount: lines.length,
-        itemBuilder: (BuildContext context, int index) {
-          return Padding(
-            padding: const EdgeInsets.symmetric(vertical: 2.0, horizontal: 8.0),
-            child: Text(lines[index]),
-          );
-        },
-      ),
-    );
+  void initState() {
+    super.initState();
+    _prepareAndScan();
   }
 
-  Future<void> loadData() async {
-    while (true) {
-      await Future<void>.delayed(const Duration(seconds: 1));
-      setState(() {});
+  Future<void> _prepareAndScan() async {
+    final btState = await FlutterBluePlus.adapterState.first;
+    if (btState != BluetoothAdapterState.on) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please turn on Bluetooth')));
+      return;
     }
+    if (Platform.isAndroid) {
+      final status = await [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ].request();
+      if (status[Permission.bluetoothScan] != PermissionStatus.granted ||
+          status[Permission.bluetoothConnect] != PermissionStatus.granted ||
+          status[Permission.locationWhenInUse] != PermissionStatus.granted) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Permissions denied')));
+        return;
+      }
+    }
+    FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+    _scanSub = FlutterBluePlus.scanResults.listen((results) {
+      for (var r in results) {
+        final d = r.device;
+        final name = d.platformName;
+        if (name.contains('Jarvis') && !_devices.contains(d)) {
+          setState(() => _devices.add(d));
+        }
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    FlutterBluePlus.stopScan();
+    _scanSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final apiKey = dotenv.env['OPENAI_API_KEY'] ?? '';
+    return Scaffold(
+      appBar: AppBar(title: const Text('Scan for Jarvis')),
+      body: _devices.isEmpty
+          ? const Center(child: Text('No Jarvis devices found'))
+          : ListView.builder(
+              itemCount: _devices.length,
+              itemBuilder: (ctx, i) {
+                final device = _devices[i];
+                return ListTile(
+                  title: Text(device.platformName),
+                  subtitle: Text(device.remoteId.str),
+                  onTap: () async {
+                    try {
+                      await device.connect(timeout: const Duration(seconds: 5));
+                    } catch (_) {}
+                    if (!mounted) return;
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => DeviceScreen(
+                          device: device,
+                          openaiApiKey: apiKey,
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+    );
   }
 }
