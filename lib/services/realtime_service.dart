@@ -5,16 +5,24 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:openai_realtime_dart/openai_realtime_dart.dart';
 import 'audio_player_service.dart';
+import 'transcript_service.dart';
 
 class RealtimeService {
   final RealtimeClient _client;
   final AudioPlayerService _player;
   final void Function(Uint8List wav)? onAudio;
+  final TranscriptService? transcriptService;
   bool _connected = false;
+  
+  // Buffer for accumulating small streaming chunks
+  final List<int> _audioBuffer = [];
+  static const int _minChunkSize = 48000; // ~1 second at 24kHz 16-bit
+  bool _transmitting = false;
 
   RealtimeService(
     String apiKey, {
     this.onAudio,
+    this.transcriptService,
   }) : 
     _client = RealtimeClient(apiKey: apiKey),
     _player = AudioPlayerService();
@@ -34,33 +42,43 @@ class RealtimeService {
       debugPrint('❌ Realtime API error: ${(evt as RealtimeEventError).error}');
     });
     _client.on(RealtimeEventType.conversationUpdated, (evt) {
-      final t = (evt as RealtimeEventConversationUpdated)
-        .result.delta?.transcript;
-      debugPrint('🗣 partial transcript: "${t ?? ''}"');
+      final event = (evt as RealtimeEventConversationUpdated);
+      final transcript = event.result.delta?.transcript;
+      final audioData = event.result.delta?.audio;
+      
+      debugPrint('🗣 partial transcript: "${transcript ?? ''}"');
+      
+      // Update transcript with partial response
+      if (transcript != null && transcript.isNotEmpty && transcriptService != null) {
+        transcriptService!.addPartialAssistantMessage(transcript);
+      }
+      
+      // Accumulate small audio chunks before sending
+      if (audioData != null && audioData.isNotEmpty) {
+        final pcmBytes = audioData.cast<int>();
+        _audioBuffer.addAll(pcmBytes);
+        debugPrint('📥 accumulated ${pcmBytes.length} bytes (total: ${_audioBuffer.length})');
+        
+        // Send chunk when we have enough data (1+ seconds)
+        if (_audioBuffer.length >= _minChunkSize) {
+          _flushAudioBuffer();
+        }
+      }
     });
 
     _client.on(RealtimeEventType.conversationItemCompleted, (evt) {
       final wrapper = (evt as RealtimeEventConversationItemCompleted).item;
-      final msg        = wrapper.item as ItemMessage;
-      final rawPcm     = wrapper.formatted?.audio ?? <dynamic>[];
       final transcript = wrapper.formatted?.transcript ?? '';
-      debugPrint('✅ completed id=${msg.id} role=${msg.role.name}');
-      debugPrint('   • transcript         = "$transcript"');
-      debugPrint('   • raw PCM byte count = ${rawPcm.length}');
-
-      if (rawPcm.isNotEmpty) {
-        final pcmBytes = rawPcm.cast<int>();
-        final wav = _buildPcmWav(pcmBytes);
-        debugPrint('   • built 24 kHz WAV: ${wav.length} bytes');
-        if (onAudio != null) {
-          onAudio!(wav);
-        } else {
-          _player.playBuffer(wav, onFinished: () {
-            debugPrint('🔈 TTS playback finished');
-          });
-        }
-      } else {
-        debugPrint('   • no audio payload');
+      debugPrint('✅ completed response: "$transcript"');
+      
+      // Finalize transcript with completed response
+      if (transcript.isNotEmpty && transcriptService != null) {
+        transcriptService!.finalizeAssistantMessage(transcript);
+      }
+      
+      // Force flush any remaining audio buffer, even if transmitting
+      if (_audioBuffer.isNotEmpty) {
+        _forceFlushAudioBuffer();
       }
     });
 
@@ -70,13 +88,30 @@ class RealtimeService {
     debugPrint('🔗 connected');
   }
 
-  Future<void> sendAudio(Uint8List wavBytes) async {
+  Future<void> sendAudio(Uint8List wavBytes, {String? userTranscript}) async {
     if (!_connected) throw StateError('RealtimeService not initialized');
+    
+    // Clean up any remaining audio from previous response
+    await _cleanupPreviousResponse();
+    
+    // Add user message to transcript if provided
+    if (userTranscript != null && userTranscript.isNotEmpty && transcriptService != null) {
+      transcriptService!.addUserMessage(userTranscript);
+    }
+    
     final b64 = base64Encode(wavBytes);
     debugPrint('🎵 sendAudio: rawBytes=${wavBytes.length}, b64Chars=${b64.length}');
     await _client.sendUserMessageContent([
       ContentPart.inputAudio(audio: b64),
     ]);
+  }
+
+  Future<void> _cleanupPreviousResponse() async {
+    // Force flush any remaining audio from previous response
+    if (_audioBuffer.isNotEmpty) {
+      debugPrint('🧹 cleaning up ${_audioBuffer.length} bytes from previous response');
+      await _forceFlushAudioBuffer();
+    }
   }
 
   Future<void> dispose() async {
@@ -88,12 +123,64 @@ class RealtimeService {
     _connected = false;
   }
 
+  void _flushAudioBuffer() async {
+    if (_audioBuffer.isEmpty || _transmitting) return;
+    await _doFlushAudioBuffer();
+  }
+
+  Future<void> _forceFlushAudioBuffer() async {
+    if (_audioBuffer.isEmpty) return;
+    
+    // Wait for any current transmission to finish, then flush
+    while (_transmitting) {
+      await Future.delayed(Duration(milliseconds: 50));
+    }
+    
+    // Only flush if we have at least some meaningful audio data
+    // Ensure we have an even number of bytes for 16-bit samples
+    if (_audioBuffer.length >= 2 && _audioBuffer.length % 2 == 0) {
+      await _doFlushAudioBuffer();
+    } else {
+      debugPrint('🚫 Skipping flush of incomplete audio data: ${_audioBuffer.length} bytes');
+      _audioBuffer.clear();
+    }
+  }
+
+  Future<void> _doFlushAudioBuffer() async {
+    _transmitting = true;
+    final wav = _buildPcmWav(_audioBuffer);
+    debugPrint('🎵 flushing audio buffer: ${wav.length} bytes (${_audioBuffer.length} samples)');
+    
+    if (onAudio != null) {
+      onAudio!(wav);
+    } else {
+      _player.playBuffer(wav, onFinished: () {
+        debugPrint('🔈 TTS buffer playback finished');
+      });
+    }
+    
+    _audioBuffer.clear();
+    
+    // Wait before allowing next transmission to prevent header corruption
+    await Future.delayed(Duration(milliseconds: 500));
+    _transmitting = false;
+  }
+
   Uint8List _buildPcmWav(List<int> rawBytes) {
     const sampleRate    = 24000, // 24 kHz to match API
           numChannels   = 1,
           bitsPerSample = 16;
     final byteRate   = sampleRate * numChannels * bitsPerSample ~/ 8;
     final blockAlign = numChannels * bitsPerSample ~/ 8;
+    
+    // Ensure we have valid audio data (even number of bytes for 16-bit samples)
+    if (rawBytes.length < 2 || rawBytes.length % 2 != 0) {
+      debugPrint('⚠️ Invalid audio data length: ${rawBytes.length} bytes');
+      // Pad with a zero byte if odd length
+      if (rawBytes.length % 2 != 0) {
+        rawBytes.add(0);
+      }
+    }
     
     // Convert raw bytes to 16-bit samples (little-endian)
     final samples = <int>[];
@@ -106,6 +193,8 @@ class RealtimeService {
       final signed = sample > 32767 ? sample - 65536 : sample;
       samples.add(signed);
     }
+    
+    debugPrint('🎵 Built WAV: ${rawBytes.length} bytes → ${samples.length} samples');
     
     final dataSize = samples.length * 2;  // 2 bytes per 16-bit sample
     final fileSize = 44 + dataSize;
