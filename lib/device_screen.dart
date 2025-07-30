@@ -93,18 +93,11 @@ class _DeviceScreenState extends State<DeviceScreen> {
     super.dispose();
   }
 
-  /// Routes incoming TTS WAV to the chosen output
+  /// Send TTS audio to device (always - removed phone playback option)
   Future<void> _handleTtsAudio(Uint8List wav) async {
-    if (_config.playOnDevice) {
-      setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
-      await _streamSvc.sendWavToDevice(wav);
-      setState(() => _statusMessage = '✅ Played on device');
-    } else {
-      setState(() => _statusMessage = '🔊 Playing TTS on phone…');
-      await _playerSvc.playBuffer(wav, onFinished: () {
-        setState(() => _statusMessage = '✅ Done playing on phone');
-      });
-    }
+    setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
+    await _streamSvc.sendWavToDevice(wav);
+    setState(() => _statusMessage = '✅ Played on device');
   }
 
   Future<void> _startProcessing() async {
@@ -195,19 +188,9 @@ class _DeviceScreenState extends State<DeviceScreen> {
             Text(_statusMessage, style: Theme.of(ctx).textTheme.bodyMedium),
             const Divider(height: 32),
             SwitchListTile(
-              title: const Text('Compress Incoming Audio'),
-              value: _config.compressIncoming,
-              onChanged: (v) => setState(() => _config.setCompressIncoming(v)),
-            ),
-            SwitchListTile(
               title: const Text('Send Debug Drops'),
               value: _config.sendDebugDrops,
               onChanged: (v) => setState(() => _config.setSendDebugDrops(v)),
-            ),
-            SwitchListTile(
-              title: const Text('Play TTS on Device'),
-              value: _config.playOnDevice,
-              onChanged: (v) => setState(() => _config.setPlayOnDevice(v)),
             ),
             ListTile(
               title: const Text('LED Brightness'),
