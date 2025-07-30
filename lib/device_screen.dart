@@ -58,12 +58,16 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
     _configSvc = ConfigService(
       widget.device,
-      onConfigUpdated: () => setState(() {}),
+      onConfigUpdated: () {
+        if (mounted) setState(() {});
+      },
     );
 
     _streamSvc = AudioStreamService(
       widget.device,
-      onData: () => setState(() {}),
+      onData: () {
+        if (mounted) setState(() {});
+      },
       onDone: _startProcessing,
       config: _configSvc.config,
     );
@@ -77,10 +81,12 @@ class _DeviceScreenState extends State<DeviceScreen> {
     final btService = BluetoothConnectionService(widget.device);
     await btService.initAll([_streamSvc, _configSvc]);
 
-    setState(() {
-      _connected     = true;
-      _statusMessage = '✅ Connected – waiting for audio…';
-    });
+    if (mounted) {
+      setState(() {
+        _connected     = true;
+        _statusMessage = '✅ Connected – waiting for audio…';
+      });
+    }
   }
 
   @override
@@ -95,17 +101,19 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
   /// Send TTS audio to device (always - removed phone playback option)
   Future<void> _handleTtsAudio(Uint8List wav) async {
-    setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
+    if (mounted) setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
     await _streamSvc.sendWavToDevice(wav);
-    setState(() => _statusMessage = '✅ Played on device');
+    if (mounted) setState(() => _statusMessage = '✅ Played on device');
   }
 
   Future<void> _startProcessing() async {
     if (_isSending || _streamSvc.audioBuffer.isEmpty) return;
-    setState(() {
-      _isSending     = true;
-      _statusMessage = '🎤 Sending your audio to OpenAI…';
-    });
+    if (mounted) {
+      setState(() {
+        _isSending     = true;
+        _statusMessage = '🎤 Sending your audio to OpenAI…';
+      });
+    }
 
     final wav = _streamSvc.getPcmWav();
     
@@ -122,9 +130,11 @@ class _DeviceScreenState extends State<DeviceScreen> {
       // Wait for realtime API to complete
       await realtimeTask;
       
-      setState(() {
-        _statusMessage = '⏳ Awaiting assistant reply…';
-      });
+      if (mounted) {
+        setState(() {
+          _statusMessage = '⏳ Awaiting assistant reply…';
+        });
+      }
       
       // Let transcription continue in background
       transcriptionTask.catchError((e) {
@@ -139,9 +149,11 @@ class _DeviceScreenState extends State<DeviceScreen> {
         ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text('Error: $e')));
       }
-      setState(() {
-        _statusMessage = '⚠️ Error: $e';
-      });
+      if (mounted) {
+        setState(() {
+          _statusMessage = '⚠️ Error: $e';
+        });
+      }
       // Update placeholder with error
       _transcriptSvc.updateUserMessage(placeholderMessageId, "❌ Error sending audio");
     } finally {
