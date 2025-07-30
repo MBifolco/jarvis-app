@@ -92,21 +92,42 @@ class AudioStreamService implements BlePeripheralService {
     debugPrint('🔍 Round-trip compare: $sampleCount samples; differences: $diffs; max sample-error: $maxErr');
   }
 
-  Future<void> sendWavToDevice(Uint8List wav) async {
+  Future<void> sendPcmToDevice(Uint8List pcmData) async {
     if (_writeChr == null) throw StateError('Audio write characteristic not initialized');
     final mtu = await device.mtu.first;
     final chunkSize = mtu - 3;
 
-    // Always send raw PCM data without WAV header, but with length header
-    final pcmData = wav.sublist(44); // Skip 44-byte WAV header
+    // Back to simple 4-byte length header with corruption detection on device side
     final header = ByteData(4)..setUint32(0, pcmData.length, Endian.little);
     final packet = Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
-    debugPrint("📤 Sending uncompressed PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 4 header)");
+    
+    final startTime = DateTime.now().millisecondsSinceEpoch;
+    debugPrint("📤 BLE START: Sending raw PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 4 header)");
+    debugPrint("📤 Header bytes: [0x${header.getUint8(0).toRadixString(16).padLeft(2, '0')}, 0x${header.getUint8(1).toRadixString(16).padLeft(2, '0')}, 0x${header.getUint8(2).toRadixString(16).padLeft(2, '0')}, 0x${header.getUint8(3).toRadixString(16).padLeft(2, '0')}] = ${pcmData.length} bytes");
 
+    int bleChunks = 0;
     for (var offset = 0; offset < packet.length; offset += chunkSize) {
       final end = min(offset + chunkSize, packet.length);
-      await _writeChr!.write(packet.sublist(offset, end), withoutResponse: true);
+      final chunk = packet.sublist(offset, end);
+      
+      // Log exactly what we're sending to BLE for first few chunks
+      if (offset == 0 || offset == chunkSize) {
+        debugPrint("📤 BLE chunk at offset $offset: ${chunk.take(min(12, chunk.length)).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}${chunk.length > 12 ? '...' : ''}");
+      }
+      
+      await _writeChr!.write(chunk, withoutResponse: true);
+      bleChunks++;
     }
+    
+    final endTime = DateTime.now().millisecondsSinceEpoch;
+    debugPrint("📤 BLE COMPLETE: Sent $bleChunks BLE chunks in ${endTime - startTime}ms");
+    debugPrint("📤 Complete packet header: ${packet.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')} (first 8 bytes)");
+  }
+
+  Future<void> sendWavToDevice(Uint8List wav) async {
+    // Extract PCM from WAV and delegate to sendPcmToDevice
+    final pcmData = wav.sublist(44); // Skip 44-byte WAV header
+    await sendPcmToDevice(pcmData);
   }
 
   Uint8List getPcmWav() {

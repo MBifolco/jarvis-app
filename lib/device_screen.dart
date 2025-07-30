@@ -48,7 +48,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
     _transcriptSvc = TranscriptService();
     _whisperSvc = WhisperService(widget.openaiApiKey);
 
-    // onAudio will be called for each TTS WAV
+    // onAudio will be called for each TTS PCM chunk
     _realtimeSvc = RealtimeService(
       widget.openaiApiKey,
       onAudio: _handleTtsAudio,
@@ -100,9 +100,9 @@ class _DeviceScreenState extends State<DeviceScreen> {
   }
 
   /// Send TTS audio to device (always - removed phone playback option)
-  Future<void> _handleTtsAudio(Uint8List wav) async {
+  Future<void> _handleTtsAudio(Uint8List pcm) async {
     if (mounted) setState(() => _statusMessage = '🔊 Sending TTS to device speaker…');
-    await _streamSvc.sendWavToDevice(wav);
+    await _streamSvc.sendPcmToDevice(pcm);
     if (mounted) setState(() => _statusMessage = '✅ Played on device');
   }
 

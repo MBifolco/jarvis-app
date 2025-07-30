@@ -10,14 +10,15 @@ import 'transcript_service.dart';
 class RealtimeService {
   final RealtimeClient _client;
   final AudioPlayerService _player;
-  final void Function(Uint8List wav)? onAudio;
+  final void Function(Uint8List pcm)? onAudio;
   final TranscriptService? transcriptService;
   bool _connected = false;
   
   // Buffer for accumulating small streaming chunks
   final List<int> _audioBuffer = [];
-  static const int _minChunkSize = 48000; // ~1 second at 24kHz 16-bit
+  static const int _minChunkSize = 96000; // ~2 seconds at 24kHz 16-bit - reasonable chunk size with sequence numbers
   bool _transmitting = false;
+  int _chunkCounter = 0;
 
   RealtimeService(
     String apiKey, {
@@ -148,12 +149,24 @@ class RealtimeService {
 
   Future<void> _doFlushAudioBuffer() async {
     _transmitting = true;
-    final wav = _buildPcmWav(_audioBuffer);
-    debugPrint('🎵 flushing audio buffer: ${wav.length} bytes (${_audioBuffer.length} samples)');
+    _chunkCounter++;
+    final pcmData = Uint8List.fromList(_audioBuffer);
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    
+    debugPrint('🎵 CHUNK $_chunkCounter: START sending at timestamp $timestamp: ${pcmData.length} bytes raw PCM');
+    debugPrint('🎵 CHUNK $_chunkCounter: PCM first 8 bytes: ${pcmData.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
+    debugPrint('🎵 CHUNK $_chunkCounter: PCM last 8 bytes: ${pcmData.skip(pcmData.length - 8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
     
     if (onAudio != null) {
-      onAudio!(wav);
+      onAudio!(pcmData);
+      // Note: onAudio is synchronous but it triggers async BLE operations
+      // Add a small delay to ensure BLE transmission completes
+      await Future.delayed(Duration(milliseconds: 100));
+      final endTimestamp = DateTime.now().millisecondsSinceEpoch;
+      debugPrint('🎵 CHUNK $_chunkCounter: FINISHED sending at timestamp $endTimestamp (took ${endTimestamp - timestamp}ms)');
     } else {
+      // For phone playback, we still need WAV format
+      final wav = _buildPcmWav(_audioBuffer);
       _player.playBuffer(wav, onFinished: () {
         debugPrint('🔈 TTS buffer playback finished');
       });
@@ -161,8 +174,12 @@ class RealtimeService {
     
     _audioBuffer.clear();
     
-    // Wait before allowing next transmission to prevent header corruption
-    await Future.delayed(Duration(milliseconds: 500));
+    // Add significant delay between chunks to prevent overlap
+    debugPrint('🎵 CHUNK $_chunkCounter: Starting 2-second delay before next chunk...');
+    await Future.delayed(Duration(milliseconds: 2000));  // 2 second delay
+    
+    final readyTimestamp = DateTime.now().millisecondsSinceEpoch;
+    debugPrint('🎵 CHUNK $_chunkCounter: READY for next chunk at timestamp $readyTimestamp');
     _transmitting = false;
   }
 
