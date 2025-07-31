@@ -97,7 +97,7 @@ class AudioStreamService implements BlePeripheralService {
     final mtu = await device.mtu.first;
     final chunkSize = mtu - 3;
 
-    // Back to simple 4-byte length header with corruption detection on device side
+    // Simple 4-byte length header
     final header = ByteData(4)..setUint32(0, pcmData.length, Endian.little);
     final packet = Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
     

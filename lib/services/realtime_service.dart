@@ -16,7 +16,7 @@ class RealtimeService {
   
   // Buffer for accumulating small streaming chunks
   final List<int> _audioBuffer = [];
-  static const int _minChunkSize = 96000; // ~2 seconds at 24kHz 16-bit - balanced size
+  static const int _minChunkSize = 48000; // ~1 second at 24kHz 16-bit - smaller for faster transmission
   bool _transmitting = false;
   int _chunkCounter = 0;
 
@@ -57,8 +57,11 @@ class RealtimeService {
       // Accumulate small audio chunks before sending
       if (audioData != null && audioData.isNotEmpty) {
         final pcmBytes = audioData.cast<int>();
+        final beforeSize = _audioBuffer.length;
         _audioBuffer.addAll(pcmBytes);
-        debugPrint('📥 accumulated ${pcmBytes.length} bytes (total: ${_audioBuffer.length})');
+        final afterSize = _audioBuffer.length;
+        final bufferSeconds = afterSize / 48000.0; // 48KB per second
+        debugPrint('📥 accumulated ${pcmBytes.length} bytes: ${beforeSize} → ${afterSize} (${bufferSeconds.toStringAsFixed(1)}s buffered)');
         
         // Send chunk when we have enough data (1+ seconds)
         if (_audioBuffer.length >= _minChunkSize) {
@@ -125,7 +128,13 @@ class RealtimeService {
   }
 
   void _flushAudioBuffer() async {
-    if (_audioBuffer.isEmpty || _transmitting) return;
+    if (_audioBuffer.isEmpty) return;
+    
+    if (_transmitting) {
+      debugPrint('⏳ Flush blocked - already transmitting (buffer: ${_audioBuffer.length} bytes = ${(_audioBuffer.length / 48000.0).toStringAsFixed(1)}s)');
+      return;
+    }
+    
     await _doFlushAudioBuffer();
   }
 
@@ -150,10 +159,15 @@ class RealtimeService {
   Future<void> _doFlushAudioBuffer() async {
     _transmitting = true;
     _chunkCounter++;
-    final pcmData = Uint8List.fromList(_audioBuffer);
+    
+    // Extract exactly _minChunkSize bytes (or all if less)
+    final bytesToSend = _audioBuffer.length >= _minChunkSize ? _minChunkSize : _audioBuffer.length;
+    final pcmData = Uint8List.fromList(_audioBuffer.take(bytesToSend).toList());
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     
-    debugPrint('🎵 CHUNK $_chunkCounter: START sending at timestamp $timestamp: ${pcmData.length} bytes raw PCM');
+    final bufferSeconds = _audioBuffer.length / 48000.0;
+    final chunkSeconds = pcmData.length / 48000.0;
+    debugPrint('🎵 CHUNK $_chunkCounter: START sending at timestamp $timestamp: ${pcmData.length} bytes (${chunkSeconds.toStringAsFixed(1)}s) from buffer of ${_audioBuffer.length} bytes (${bufferSeconds.toStringAsFixed(1)}s)');
     debugPrint('🎵 CHUNK $_chunkCounter: PCM first 8 bytes: ${pcmData.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
     debugPrint('🎵 CHUNK $_chunkCounter: PCM last 8 bytes: ${pcmData.skip(pcmData.length - 8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
     
@@ -166,23 +180,40 @@ class RealtimeService {
       debugPrint('🎵 CHUNK $_chunkCounter: FINISHED sending at timestamp $endTimestamp (took ${endTimestamp - timestamp}ms)');
     } else {
       // For phone playback, we still need WAV format
-      final wav = _buildPcmWav(_audioBuffer);
+      final wav = _buildPcmWav(pcmData.cast<int>().toList());
       _player.playBuffer(wav, onFinished: () {
         debugPrint('🔈 TTS buffer playback finished');
       });
     }
     
-    _audioBuffer.clear();
+    // Remove only the bytes we sent
+    _audioBuffer.removeRange(0, bytesToSend);
     
     // Add delay to ensure device finishes processing before next chunk
     // This prevents header corruption from concurrent packets
-    // With 192KB chunks, we need more time for BLE transmission + processing
-    debugPrint('🎵 CHUNK $_chunkCounter: Starting 1000ms delay before next chunk...');
-    await Future.delayed(Duration(milliseconds: 1000));  // 1 second for larger chunks
+    // With 48KB chunks (1 second of audio), transmission is faster (~300ms)
+    // Device needs ~85ms to process, so 400ms total should be safe
+    debugPrint('🎵 CHUNK $_chunkCounter: Starting 400ms delay before next chunk...');
+    await Future.delayed(Duration(milliseconds: 400));
     
     final readyTimestamp = DateTime.now().millisecondsSinceEpoch;
     debugPrint('🎵 CHUNK $_chunkCounter: READY for next chunk at timestamp $readyTimestamp');
     _transmitting = false;
+    
+    // Check if we need to send more chunks
+    if (_audioBuffer.length >= _minChunkSize) {
+      final remainingSeconds = _audioBuffer.length / 48000.0;
+      debugPrint('🎵 Buffer still has ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s) - scheduling next chunk');
+      // Schedule next chunk with a small delay to avoid BLE corruption
+      Future.delayed(Duration(milliseconds: 50), () {
+        if (_audioBuffer.length >= _minChunkSize && !_transmitting) {
+          _flushAudioBuffer();
+        }
+      });
+    } else if (_audioBuffer.length > 0) {
+      final remainingSeconds = _audioBuffer.length / 48000.0;
+      debugPrint('🎵 Buffer has ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s) remaining - waiting for more data');
+    }
   }
 
   Uint8List _buildPcmWav(List<int> rawBytes) {
