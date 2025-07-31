@@ -1,5 +1,6 @@
 // lib/services/realtime_service.dart
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
@@ -22,6 +23,7 @@ class RealtimeService {
   int _chunkCounter = 0;
   bool _responseInProgress = false;
   bool _forceFlushing = false;  // Track if we're in force flush mode
+  Timer? _responseTimeoutTimer;
 
   RealtimeService(
     String apiKey, {
@@ -33,6 +35,14 @@ class RealtimeService {
 
   Future<void> init() async {
     debugPrint('🚀 [RealtimeService] init()');
+    
+    // Reset connection state
+    _connected = false;
+    _responseInProgress = false;
+    _transmitting = false;
+    _forceFlushing = false;
+    _audioBuffer.clear();
+    
     await _player.init();
     await _client.updateSession(
       voice: Voice.alloy,
@@ -43,7 +53,23 @@ class RealtimeService {
       instructions: 'You are a helpful assistant. Always respond in English only.',
     );
     _client.on(RealtimeEventType.error, (evt) {
-      debugPrint('❌ Realtime API error: ${(evt as RealtimeEventError).error}');
+      final error = (evt as RealtimeEventError).error;
+      debugPrint('❌ Realtime API error: $error');
+      debugPrint('❌ Error details: ${error.message}');
+      if (error.code != null) {
+        debugPrint('❌ Error code: ${error.code}');
+      }
+      
+      // Reset state on error
+      _responseInProgress = false;
+      _transmitting = false;
+      _forceFlushing = false;
+      
+      // Clear any pending audio buffer
+      if (_audioBuffer.isNotEmpty) {
+        debugPrint('❌ Clearing ${_audioBuffer.length} bytes from buffer due to error');
+        _audioBuffer.clear();
+      }
     });
     _client.on(RealtimeEventType.conversationUpdated, (evt) {
       final event = (evt as RealtimeEventConversationUpdated);
@@ -60,6 +86,13 @@ class RealtimeService {
       // Accumulate small audio chunks before sending
       if (audioData != null && audioData.isNotEmpty) {
         _responseInProgress = true;  // Mark that we're receiving audio
+        
+        // Cancel timeout timer since we're receiving a response
+        if (_responseTimeoutTimer != null && _responseTimeoutTimer!.isActive) {
+          debugPrint('⏰ Cancelling timeout timer - response received');
+          _responseTimeoutTimer!.cancel();
+        }
+        
         final pcmBytes = audioData.cast<int>();
         final beforeSize = _audioBuffer.length;
         _audioBuffer.addAll(pcmBytes);
@@ -106,14 +139,53 @@ class RealtimeService {
       _responseInProgress = false;  // Reset for next response
     });
 
+    // Add session created event handler to confirm connection
+    _client.on(RealtimeEventType.sessionCreated, (evt) {
+      debugPrint('✅ Session created successfully');
+      final session = (evt as RealtimeEventSessionCreated).session;
+      debugPrint('✅ Session ID: ${session.id}');
+      debugPrint('✅ Model: ${session.model}');
+      _connected = true;  // Mark as truly connected only after session is created
+    });
+    
+    // Add session updated event handler
+    _client.on(RealtimeEventType.sessionUpdated, (evt) {
+      debugPrint('🔄 Session updated');
+    });
+    
+    // Monitor for disconnection or connection issues
+    _client.on(RealtimeEventType.close, (evt) {
+      debugPrint('⚠️ WebSocket connection closed');
+      _connected = false;
+      // Cancel any pending operations
+      _responseTimeoutTimer?.cancel();
+      _responseInProgress = false;
+      _transmitting = false;
+      _forceFlushing = false;
+    });
+    
     debugPrint('🌐 connecting RealtimeClient…');
-    await _client.connect();
-    _connected = true;
-    debugPrint('🔗 connected');
+    try {
+      await _client.connect();
+      _connected = true;
+      debugPrint('🔗 connected');
+    } catch (e) {
+      debugPrint('❌ Failed to connect to RealtimeClient: $e');
+      _connected = false;
+      throw e;
+    }
   }
 
   Future<void> sendAudio(Uint8List wavBytes, {String? userTranscript}) async {
-    if (!_connected) throw StateError('RealtimeService not initialized');
+    if (!_connected) {
+      debugPrint('⚠️ RealtimeService not connected, attempting to reconnect...');
+      try {
+        await init();
+      } catch (e) {
+        debugPrint('❌ Failed to reconnect: $e');
+        throw StateError('RealtimeService not initialized and reconnection failed');
+      }
+    }
     
     debugPrint('🎤 NEW USER REQUEST - buffer before cleanup: ${_audioBuffer.length} bytes');
     
@@ -125,11 +197,50 @@ class RealtimeService {
       transcriptService!.addUserMessage(userTranscript);
     }
     
+    // Cancel any existing timeout timer
+    _responseTimeoutTimer?.cancel();
+    
+    // Set a timeout for the response (30 seconds - increased from 15)
+    _responseTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      debugPrint('⏰ Response timeout! No response received within 30 seconds');
+      
+      // Reset state
+      _responseInProgress = false;
+      _transmitting = false;
+      _forceFlushing = false;
+      
+      // Clear any pending audio buffer
+      if (_audioBuffer.isNotEmpty) {
+        debugPrint('⏰ Clearing ${_audioBuffer.length} bytes from buffer due to timeout');
+        _audioBuffer.clear();
+      }
+      
+      // Notify transcript service of timeout
+      if (transcriptService != null) {
+        transcriptService!.addPartialAssistantMessage('[Response timeout - no response received]');
+        transcriptService!.finalizeAssistantMessage('[Response timeout - no response received]');
+      }
+    });
+    
     final b64 = base64Encode(wavBytes);
     debugPrint('🎵 sendAudio: rawBytes=${wavBytes.length}, b64Chars=${b64.length}');
-    await _client.sendUserMessageContent([
-      ContentPart.inputAudio(audio: b64),
-    ]);
+    debugPrint('🎵 Connection state: connected=$_connected');
+    
+    try {
+      debugPrint('🎵 Sending audio to OpenAI...');
+      await _client.sendUserMessageContent([
+        ContentPart.inputAudio(audio: b64),
+      ]);
+      debugPrint('🎵 Audio sent successfully, waiting for response...');
+    } catch (e) {
+      debugPrint('❌ Error sending audio to OpenAI: $e');
+      debugPrint('❌ Error type: ${e.runtimeType}');
+      if (e is Exception) {
+        debugPrint('❌ Exception details: ${e.toString()}');
+      }
+      _responseTimeoutTimer?.cancel();
+      rethrow;
+    }
   }
 
   Future<void> _cleanupPreviousResponse() async {
@@ -150,11 +261,30 @@ class RealtimeService {
 
   Future<void> dispose() async {
     debugPrint('🛑 disposing RealtimeService');
+    
+    // Cancel any active timers
+    _responseTimeoutTimer?.cancel();
+    
+    // Reset all state
+    _responseInProgress = false;
+    _transmitting = false;
+    _forceFlushing = false;
+    _connected = false;
+    
+    // Clear any pending audio buffer
+    if (_audioBuffer.isNotEmpty) {
+      debugPrint('🛑 Clearing ${_audioBuffer.length} bytes from buffer on dispose');
+      _audioBuffer.clear();
+    }
+    
     _player.dispose();
+    
     try {
       await _client.disconnect();
-    } catch (_) {}
-    _connected = false;
+      debugPrint('🛑 RealtimeClient disconnected');
+    } catch (e) {
+      debugPrint('❌ Error disconnecting RealtimeClient: $e');
+    }
   }
 
   void _flushAudioBuffer() async {
