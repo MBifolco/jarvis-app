@@ -16,7 +16,7 @@ class RealtimeService {
   
   // Buffer for accumulating small streaming chunks
   final List<int> _audioBuffer = [];
-  static const int _minChunkSize = 96000; // ~2 seconds at 24kHz 16-bit - reasonable chunk size with sequence numbers
+  static const int _minChunkSize = 96000; // ~2 seconds at 24kHz 16-bit - balanced size
   bool _transmitting = false;
   int _chunkCounter = 0;
 
@@ -174,9 +174,11 @@ class RealtimeService {
     
     _audioBuffer.clear();
     
-    // Add significant delay between chunks to prevent overlap
-    debugPrint('🎵 CHUNK $_chunkCounter: Starting 2-second delay before next chunk...');
-    await Future.delayed(Duration(milliseconds: 2000));  // 2 second delay
+    // Add delay to ensure device finishes processing before next chunk
+    // This prevents header corruption from concurrent packets
+    // With 192KB chunks, we need more time for BLE transmission + processing
+    debugPrint('🎵 CHUNK $_chunkCounter: Starting 1000ms delay before next chunk...');
+    await Future.delayed(Duration(milliseconds: 1000));  // 1 second for larger chunks
     
     final readyTimestamp = DateTime.now().millisecondsSinceEpoch;
     debugPrint('🎵 CHUNK $_chunkCounter: READY for next chunk at timestamp $readyTimestamp');
