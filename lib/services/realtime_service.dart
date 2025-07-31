@@ -1,5 +1,6 @@
 // lib/services/realtime_service.dart
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
@@ -17,8 +18,12 @@ class RealtimeService {
   // Buffer for accumulating small streaming chunks
   final List<int> _audioBuffer = [];
   static const int _minChunkSize = 48000; // ~1 second at 24kHz 16-bit - smaller for faster transmission
+  static const int _minFinalChunkSize = 2400; // 0.1 second minimum for final chunks
   bool _transmitting = false;
   int _chunkCounter = 0;
+  bool _responseInProgress = false;
+  bool _forceFlushing = false;  // Track if we're in force flush mode
+  Timer? _responseTimeoutTimer;
 
   RealtimeService(
     String apiKey, {
@@ -30,6 +35,14 @@ class RealtimeService {
 
   Future<void> init() async {
     debugPrint('🚀 [RealtimeService] init()');
+    
+    // Reset connection state
+    _connected = false;
+    _responseInProgress = false;
+    _transmitting = false;
+    _forceFlushing = false;
+    _audioBuffer.clear();
+    
     await _player.init();
     await _client.updateSession(
       voice: Voice.alloy,
@@ -40,7 +53,23 @@ class RealtimeService {
       instructions: 'You are a helpful assistant. Always respond in English only.',
     );
     _client.on(RealtimeEventType.error, (evt) {
-      debugPrint('❌ Realtime API error: ${(evt as RealtimeEventError).error}');
+      final error = (evt as RealtimeEventError).error;
+      debugPrint('❌ Realtime API error: $error');
+      debugPrint('❌ Error details: ${error.message}');
+      if (error.code != null) {
+        debugPrint('❌ Error code: ${error.code}');
+      }
+      
+      // Reset state on error
+      _responseInProgress = false;
+      _transmitting = false;
+      _forceFlushing = false;
+      
+      // Clear any pending audio buffer
+      if (_audioBuffer.isNotEmpty) {
+        debugPrint('❌ Clearing ${_audioBuffer.length} bytes from buffer due to error');
+        _audioBuffer.clear();
+      }
     });
     _client.on(RealtimeEventType.conversationUpdated, (evt) {
       final event = (evt as RealtimeEventConversationUpdated);
@@ -56,12 +85,21 @@ class RealtimeService {
       
       // Accumulate small audio chunks before sending
       if (audioData != null && audioData.isNotEmpty) {
+        _responseInProgress = true;  // Mark that we're receiving audio
+        
+        // Cancel timeout timer since we're receiving a response
+        if (_responseTimeoutTimer != null && _responseTimeoutTimer!.isActive) {
+          debugPrint('⏰ Cancelling timeout timer - response received');
+          _responseTimeoutTimer!.cancel();
+        }
+        
         final pcmBytes = audioData.cast<int>();
         final beforeSize = _audioBuffer.length;
         _audioBuffer.addAll(pcmBytes);
         final afterSize = _audioBuffer.length;
         final bufferSeconds = afterSize / 48000.0; // 48KB per second
-        debugPrint('📥 accumulated ${pcmBytes.length} bytes: ${beforeSize} → ${afterSize} (${bufferSeconds.toStringAsFixed(1)}s buffered)');
+        final timestamp = DateTime.now().millisecondsSinceEpoch;
+        debugPrint('📥 accumulated ${pcmBytes.length} bytes: ${beforeSize} → ${afterSize} (${bufferSeconds.toStringAsFixed(1)}s buffered) at $timestamp');
         
         // Send chunk when we have enough data (1+ seconds)
         if (_audioBuffer.length >= _minChunkSize) {
@@ -70,10 +108,12 @@ class RealtimeService {
       }
     });
 
-    _client.on(RealtimeEventType.conversationItemCompleted, (evt) {
+    _client.on(RealtimeEventType.conversationItemCompleted, (evt) async {
       final wrapper = (evt as RealtimeEventConversationItemCompleted).item;
       final transcript = wrapper.formatted?.transcript ?? '';
-      debugPrint('✅ completed response: "$transcript"');
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      debugPrint('✅ completed response at $timestamp: "$transcript"');
+      debugPrint('✅ Audio buffer at completion: ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s)');
       
       // Finalize transcript with completed response
       if (transcript.isNotEmpty && transcriptService != null) {
@@ -81,19 +121,73 @@ class RealtimeService {
       }
       
       // Force flush any remaining audio buffer, even if transmitting
-      if (_audioBuffer.isNotEmpty) {
-        _forceFlushAudioBuffer();
+      if (_audioBuffer.isNotEmpty || _responseInProgress) {
+        debugPrint('✅ Triggering force flush for completion (responseInProgress=$_responseInProgress)');
+        // Add a small delay to ensure all streaming data has been accumulated
+        await Future.delayed(Duration(milliseconds: 200));
+        
+        if (_audioBuffer.isNotEmpty) {
+          debugPrint('✅ Force flushing ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s)');
+          await _forceFlushAudioBuffer();
+        }
+        
+        // Add delay after force flush to ensure device has time to play final chunk
+        await Future.delayed(Duration(milliseconds: 500));
+        debugPrint('✅ Force flush complete, final chunk should be playing');
       }
+      
+      _responseInProgress = false;  // Reset for next response
     });
 
+    // Add session created event handler to confirm connection
+    _client.on(RealtimeEventType.sessionCreated, (evt) {
+      debugPrint('✅ Session created successfully');
+      final session = (evt as RealtimeEventSessionCreated).session;
+      debugPrint('✅ Session ID: ${session.id}');
+      debugPrint('✅ Model: ${session.model}');
+      _connected = true;  // Mark as truly connected only after session is created
+    });
+    
+    // Add session updated event handler
+    _client.on(RealtimeEventType.sessionUpdated, (evt) {
+      debugPrint('🔄 Session updated');
+    });
+    
+    // Monitor for disconnection or connection issues
+    _client.on(RealtimeEventType.close, (evt) {
+      debugPrint('⚠️ WebSocket connection closed');
+      _connected = false;
+      // Cancel any pending operations
+      _responseTimeoutTimer?.cancel();
+      _responseInProgress = false;
+      _transmitting = false;
+      _forceFlushing = false;
+    });
+    
     debugPrint('🌐 connecting RealtimeClient…');
-    await _client.connect();
-    _connected = true;
-    debugPrint('🔗 connected');
+    try {
+      await _client.connect();
+      _connected = true;
+      debugPrint('🔗 connected');
+    } catch (e) {
+      debugPrint('❌ Failed to connect to RealtimeClient: $e');
+      _connected = false;
+      throw e;
+    }
   }
 
   Future<void> sendAudio(Uint8List wavBytes, {String? userTranscript}) async {
-    if (!_connected) throw StateError('RealtimeService not initialized');
+    if (!_connected) {
+      debugPrint('⚠️ RealtimeService not connected, attempting to reconnect...');
+      try {
+        await init();
+      } catch (e) {
+        debugPrint('❌ Failed to reconnect: $e');
+        throw StateError('RealtimeService not initialized and reconnection failed');
+      }
+    }
+    
+    debugPrint('🎤 NEW USER REQUEST - buffer before cleanup: ${_audioBuffer.length} bytes');
     
     // Clean up any remaining audio from previous response
     await _cleanupPreviousResponse();
@@ -103,11 +197,50 @@ class RealtimeService {
       transcriptService!.addUserMessage(userTranscript);
     }
     
+    // Cancel any existing timeout timer
+    _responseTimeoutTimer?.cancel();
+    
+    // Set a timeout for the response (30 seconds - increased from 15)
+    _responseTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      debugPrint('⏰ Response timeout! No response received within 30 seconds');
+      
+      // Reset state
+      _responseInProgress = false;
+      _transmitting = false;
+      _forceFlushing = false;
+      
+      // Clear any pending audio buffer
+      if (_audioBuffer.isNotEmpty) {
+        debugPrint('⏰ Clearing ${_audioBuffer.length} bytes from buffer due to timeout');
+        _audioBuffer.clear();
+      }
+      
+      // Notify transcript service of timeout
+      if (transcriptService != null) {
+        transcriptService!.addPartialAssistantMessage('[Response timeout - no response received]');
+        transcriptService!.finalizeAssistantMessage('[Response timeout - no response received]');
+      }
+    });
+    
     final b64 = base64Encode(wavBytes);
     debugPrint('🎵 sendAudio: rawBytes=${wavBytes.length}, b64Chars=${b64.length}');
-    await _client.sendUserMessageContent([
-      ContentPart.inputAudio(audio: b64),
-    ]);
+    debugPrint('🎵 Connection state: connected=$_connected');
+    
+    try {
+      debugPrint('🎵 Sending audio to OpenAI...');
+      await _client.sendUserMessageContent([
+        ContentPart.inputAudio(audio: b64),
+      ]);
+      debugPrint('🎵 Audio sent successfully, waiting for response...');
+    } catch (e) {
+      debugPrint('❌ Error sending audio to OpenAI: $e');
+      debugPrint('❌ Error type: ${e.runtimeType}');
+      if (e is Exception) {
+        debugPrint('❌ Exception details: ${e.toString()}');
+      }
+      _responseTimeoutTimer?.cancel();
+      rethrow;
+    }
   }
 
   Future<void> _cleanupPreviousResponse() async {
@@ -115,16 +248,43 @@ class RealtimeService {
     if (_audioBuffer.isNotEmpty) {
       debugPrint('🧹 cleaning up ${_audioBuffer.length} bytes from previous response');
       await _forceFlushAudioBuffer();
+      // Extra delay to ensure last chunk plays
+      await Future.delayed(Duration(milliseconds: 500));
     }
+    
+    // Reset state for new response
+    _responseInProgress = false;
+    _forceFlushing = false;
+    _chunkCounter = 0;
+    debugPrint('🧹 cleanup complete, ready for new response');
   }
 
   Future<void> dispose() async {
     debugPrint('🛑 disposing RealtimeService');
+    
+    // Cancel any active timers
+    _responseTimeoutTimer?.cancel();
+    
+    // Reset all state
+    _responseInProgress = false;
+    _transmitting = false;
+    _forceFlushing = false;
+    _connected = false;
+    
+    // Clear any pending audio buffer
+    if (_audioBuffer.isNotEmpty) {
+      debugPrint('🛑 Clearing ${_audioBuffer.length} bytes from buffer on dispose');
+      _audioBuffer.clear();
+    }
+    
     _player.dispose();
+    
     try {
       await _client.disconnect();
-    } catch (_) {}
-    _connected = false;
+      debugPrint('🛑 RealtimeClient disconnected');
+    } catch (e) {
+      debugPrint('❌ Error disconnecting RealtimeClient: $e');
+    }
   }
 
   void _flushAudioBuffer() async {
@@ -141,19 +301,37 @@ class RealtimeService {
   Future<void> _forceFlushAudioBuffer() async {
     if (_audioBuffer.isEmpty) return;
     
+    debugPrint('🔥 FORCE FLUSH CALLED: ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s) buffered');
+    
+    _forceFlushing = true;  // Enter force flush mode
+    
     // Wait for any current transmission to finish, then flush
+    int waitCount = 0;
     while (_transmitting) {
       await Future.delayed(Duration(milliseconds: 50));
+      waitCount++;
+      if (waitCount % 10 == 0) {
+        debugPrint('🔥 Still waiting for transmission to finish... (${waitCount * 50}ms)');
+      }
     }
     
-    // Only flush if we have at least some meaningful audio data
-    // Ensure we have an even number of bytes for 16-bit samples
-    if (_audioBuffer.length >= 2 && _audioBuffer.length % 2 == 0) {
-      await _doFlushAudioBuffer();
-    } else {
-      debugPrint('🚫 Skipping flush of incomplete audio data: ${_audioBuffer.length} bytes');
-      _audioBuffer.clear();
+    // Force flush ALL remaining data in chunks
+    while (_audioBuffer.isNotEmpty) {
+      // Only flush if we have at least some meaningful audio data
+      // Ensure we have an even number of bytes for 16-bit samples
+      if (_audioBuffer.length >= 2 && _audioBuffer.length % 2 == 0) {
+        debugPrint('🔥 FORCE FLUSHING ${_audioBuffer.length} bytes');
+        await _doFlushAudioBuffer();
+        // Small delay between chunks during force flush
+        await Future.delayed(Duration(milliseconds: 50));
+      } else {
+        debugPrint('🚫 Skipping flush of incomplete audio data: ${_audioBuffer.length} bytes');
+        _audioBuffer.clear();
+        break;
+      }
     }
+    
+    _forceFlushing = false;  // Exit force flush mode
   }
 
   Future<void> _doFlushAudioBuffer() async {
@@ -164,10 +342,11 @@ class RealtimeService {
     final bytesToSend = _audioBuffer.length >= _minChunkSize ? _minChunkSize : _audioBuffer.length;
     final pcmData = Uint8List.fromList(_audioBuffer.take(bytesToSend).toList());
     final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final isFinalChunk = bytesToSend < _minChunkSize;  // This is a partial final chunk
     
     final bufferSeconds = _audioBuffer.length / 48000.0;
     final chunkSeconds = pcmData.length / 48000.0;
-    debugPrint('🎵 CHUNK $_chunkCounter: START sending at timestamp $timestamp: ${pcmData.length} bytes (${chunkSeconds.toStringAsFixed(1)}s) from buffer of ${_audioBuffer.length} bytes (${bufferSeconds.toStringAsFixed(1)}s)');
+    debugPrint('🎵 CHUNK $_chunkCounter: START sending ${isFinalChunk ? "FINAL" : ""} at timestamp $timestamp: ${pcmData.length} bytes (${chunkSeconds.toStringAsFixed(1)}s) from buffer of ${_audioBuffer.length} bytes (${bufferSeconds.toStringAsFixed(1)}s)');
     debugPrint('🎵 CHUNK $_chunkCounter: PCM first 8 bytes: ${pcmData.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
     debugPrint('🎵 CHUNK $_chunkCounter: PCM last 8 bytes: ${pcmData.skip(pcmData.length - 8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
     
@@ -201,7 +380,12 @@ class RealtimeService {
     _transmitting = false;
     
     // Check if we need to send more chunks
-    if (_audioBuffer.length >= _minChunkSize) {
+    if (_forceFlushing && _audioBuffer.length > 0) {
+      // During force flush, send ANY remaining data
+      final remainingSeconds = _audioBuffer.length / 48000.0;
+      debugPrint('🔥 Force flush mode - will send remaining ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s)');
+      // Don't schedule, the force flush loop will handle it
+    } else if (_audioBuffer.length >= _minChunkSize) {
       final remainingSeconds = _audioBuffer.length / 48000.0;
       debugPrint('🎵 Buffer still has ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s) - scheduling next chunk');
       // Schedule next chunk with a small delay to avoid BLE corruption

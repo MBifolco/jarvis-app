@@ -29,13 +29,15 @@ The jarvis-app is a Flutter mobile application that serves as the control interf
 
 #### `bt_connection_service.dart`
 - Manages BLE device connection lifecycle
-- Handles MTU negotiation for optimal data transfer
+- Handles MTU negotiation for optimal data transfer (typically 500 bytes)
 - Coordinates service discovery and initialization
+- Monitors connection stability
 
 #### `audio_stream_service.dart`
-- Receives compressed audio data via BLE
-- Manages audio buffering and decompression
-- Handles recording state notifications
+- Receives compressed ADPCM audio data from device via BLE
+- Decompresses ADPCM to PCM for processing
+- Sends uncompressed PCM audio to device for playback
+- Implements sync pattern protocol (0xAA 0x55) for reliable streaming
 
 #### `whisper_service.dart`
 - Converts speech to text using OpenAI Whisper API
@@ -46,6 +48,8 @@ The jarvis-app is a Flutter mobile application that serves as the control interf
 - Implements OpenAI Realtime API integration
 - Handles WebSocket communication
 - Manages real-time audio conversation flow
+- Buffers TTS audio and sends 48KB chunks (1 second) to device
+- Implements 400ms inter-chunk delay for reliable transmission
 
 #### `chat_service.dart`
 - Text-based chat functionality
@@ -126,22 +130,26 @@ The app expects specific BLE services and characteristics from the device:
 - Status characteristic (notifications)
 
 ### Data Format
-- Audio: Compressed 16kHz PCM data
-- Configuration: JSON-encoded settings
+- Audio from device: ADPCM compressed, 16kHz
+- Audio to device: Uncompressed PCM, 24kHz, 16-bit mono
+- Configuration: TLV (Tag-Length-Value) encoded
 - Status: Binary status flags
 
 ## Audio Specifications
 
 ### Input (from device)
 - Sample Rate: 16kHz
-- Format: Compressed PCM
+- Format: ADPCM compressed (256-byte blocks)
 - Max Duration: 30 seconds
 - Min Duration: 1 second
 
 ### Output (to device)
-- Format: MP3/WAV
-- Sample Rate: Device-dependent
-- Delivery: Chunked over BLE
+- Format: Raw PCM (no WAV header)
+- Sample Rate: 24kHz (matching OpenAI TTS)
+- Bit Depth: 16-bit signed
+- Channels: Mono
+- Chunk Size: 48KB (1 second of audio)
+- Protocol: Sync pattern (0xAA 0x55) + 4-byte length + PCM data
 
 ## State Management
 
@@ -269,13 +277,53 @@ Logger.root.level = Level.ALL;
    - Test on real devices
    - Tag release
 
+## Critical Implementation Details
+
+### Audio Streaming Architecture
+
+#### Sync Pattern Protocol
+The app implements a sync pattern protocol for reliable audio streaming to the device:
+```dart
+// Header structure: [0xAA, 0x55, length(4 bytes)] + PCM data
+final header = ByteData(6);
+header.setUint8(0, 0xAA);  // Sync byte 1
+header.setUint8(1, 0x55);  // Sync byte 2
+header.setUint32(2, pcmData.length, Endian.little);
+```
+
+This sync pattern is CRITICAL - the device state machine looks for 0xAA 0x55 to detect packet boundaries and recover from any BLE packet corruption.
+
+#### Chunk Size and Timing
+- Audio is sent in 48KB chunks (exactly 1 second at 24kHz)
+- 400ms delay between chunks prevents BLE congestion
+- Chunks are sent synchronously to maintain order
+
+#### BLE MTU Optimization
+- App negotiates maximum MTU (typically 500 bytes)
+- Each 48KB chunk is split into ~100 BLE packets
+- Write without response for maximum throughput
+
+### Known Issues and Solutions
+
+1. **Audio Corruption**: Always use sync pattern - device will resync on next 0xAA 0x55
+2. **Playback Skips**: Ensure 400ms inter-chunk delay is maintained
+3. **Buffer Overflow**: Never send chunks larger than 48KB
+4. **State Issues**: Device expects sync pattern at start of each audio transmission
+
 ## Integration with jarvis-device
 
 When making changes that affect device communication:
 1. Review device firmware BLE implementation
-2. Ensure protocol compatibility
+2. Ensure protocol compatibility (especially sync pattern)
 3. Test with actual hardware
 4. Update both repos if protocol changes
 5. Document any breaking changes
+
+### Protocol Changes Checklist
+- [ ] Sync pattern (0xAA 0x55) maintained?
+- [ ] Chunk size still 48KB?
+- [ ] Sample rate matches (24kHz for playback)?
+- [ ] Header format unchanged (6 bytes total)?
+- [ ] Inter-chunk timing preserved (400ms)?
 
 This mobile app is the user-facing component of the Jarvis system and must maintain reliable communication with the hardware device while providing a smooth user experience.
