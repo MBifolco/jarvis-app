@@ -39,11 +39,7 @@ class DeviceConfig {
     }
   }
 
-  void setCompressIncoming(bool enabled) {
-    compressIncoming = enabled;
-    _service.sendConfigUpdate(0x01, [enabled ? 1 : 0]);
-    debugPrint('🛠️ Compress Incoming set to $enabled');
-  }
+  // setCompressIncoming removed - no longer compressing incoming audio
 
   void setSendDebugDrops(bool enabled) {
     sendDebugDrops = enabled;
@@ -51,11 +47,7 @@ class DeviceConfig {
     debugPrint('🛠️ Send Debug Drops set to $enabled');
   }
 
-  void setPlayOnDevice(bool enabled) {
-    playOnDevice = enabled;
-    _service.sendConfigUpdate(0x04, [enabled ? 1 : 0]);
-    debugPrint('🛠️ Play on Device set to $enabled');
-  }
+  // setPlayOnDevice removed - always play on device now
 
   void setLedBrightness(int value) {
     ledBrightness = value.clamp(0, 65535);

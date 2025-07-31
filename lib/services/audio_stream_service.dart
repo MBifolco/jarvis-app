@@ -92,30 +92,45 @@ class AudioStreamService implements BlePeripheralService {
     debugPrint('🔍 Round-trip compare: $sampleCount samples; differences: $diffs; max sample-error: $maxErr');
   }
 
-  Future<void> sendWavToDevice(Uint8List wav) async {
+  Future<void> sendPcmToDevice(Uint8List pcmData) async {
     if (_writeChr == null) throw StateError('Audio write characteristic not initialized');
     final mtu = await device.mtu.first;
     final chunkSize = mtu - 3;
 
-    Uint8List packet;
+    // Add sync pattern (0xAA 0x55) + 4-byte length header for robustness
+    final header = ByteData(6);
+    header.setUint8(0, 0xAA);  // Sync byte 1
+    header.setUint8(1, 0x55);  // Sync byte 2
+    header.setUint32(2, pcmData.length, Endian.little);
+    final packet = Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
+    
+    final startTime = DateTime.now().millisecondsSinceEpoch;
+    debugPrint("📤 BLE START: Sending raw PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 6 header)");
+    debugPrint("📤 Sync+Header: [0xAA, 0x55] + length=${pcmData.length} bytes");
 
-    if (config.compressIncoming) {
-      final adpcm = _encodePcmToAdpcm(wav);
-      final header = ByteData(4)..setUint32(0, adpcm.length, Endian.little);
-      packet = Uint8List.fromList([...header.buffer.asUint8List(), ...adpcm]);
-      debugPrint("📤 Sending compressed audio: ${packet.length} bytes");
-    } else {
-      // Send raw PCM data without WAV header, but with length header
-      final pcmData = wav.sublist(44); // Skip 44-byte WAV header
-      final header = ByteData(4)..setUint32(0, pcmData.length, Endian.little);
-      packet = Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
-      debugPrint("📤 Sending uncompressed PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 4 header)");
-    }
-
+    int bleChunks = 0;
     for (var offset = 0; offset < packet.length; offset += chunkSize) {
       final end = min(offset + chunkSize, packet.length);
-      await _writeChr!.write(packet.sublist(offset, end), withoutResponse: true);
+      final chunk = packet.sublist(offset, end);
+      
+      // Log exactly what we're sending to BLE for first few chunks
+      if (offset == 0 || offset == chunkSize) {
+        debugPrint("📤 BLE chunk at offset $offset: ${chunk.take(min(12, chunk.length)).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}${chunk.length > 12 ? '...' : ''}");
+      }
+      
+      await _writeChr!.write(chunk, withoutResponse: true);
+      bleChunks++;
     }
+    
+    final endTime = DateTime.now().millisecondsSinceEpoch;
+    debugPrint("📤 BLE COMPLETE: Sent $bleChunks BLE chunks in ${endTime - startTime}ms");
+    debugPrint("📤 Complete packet header: ${packet.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')} (first 8 bytes)");
+  }
+
+  Future<void> sendWavToDevice(Uint8List wav) async {
+    // Extract PCM from WAV and delegate to sendPcmToDevice
+    final pcmData = wav.sublist(44); // Skip 44-byte WAV header
+    await sendPcmToDevice(pcmData);
   }
 
   Uint8List getPcmWav() {
@@ -208,79 +223,7 @@ class AudioStreamService implements BlePeripheralService {
     ]);
   }
 
-  /// Encodes PCM WAV data into IMA ADPCM blocks (blockAlign=256)
-  Uint8List _encodePcmToAdpcm(Uint8List wav) {
-    // Parse WAV header and extract raw 16-bit samples
-    if (wav.length < 44) throw Exception('Invalid WAV buffer');
-    final byteData = ByteData.sublistView(wav);
-    final sampleCount = (wav.length - 44) ~/ 2;
-    final samples = List<int>.generate(sampleCount,
-      (i) => byteData.getInt16(44 + i * 2, Endian.little));
-    const blockAlign = 256;
-    final out = <int>[];
-    int offset = 0;
-
-    while (offset < samples.length) {
-      final endSample = min(offset + (blockAlign - 4) * 2, samples.length);
-      final blockSamples = samples.sublist(offset, endSample);
-
-      // Block header: initial predictor + index + reserved
-      final predictor = blockSamples[0];
-      out.addAll(_uint16le(predictor));
-      int index = 0;
-      out.add(index);
-      out.add(0);  // reserved byte
-      int step = _stepTable[index];
-      int predVal = predictor;
-      int nibblePair = 0;
-      bool hasHigh = false;
-
-      // Encode samples into 4-bit codes
-      for (int i = 1; i < blockSamples.length; i++) {
-        int val = blockSamples[i];
-        int diff = val - predVal;
-        int code = 0;
-        if (diff < 0) { code = 8; diff = -diff; }
-        int tempStep = step;
-        if (diff >= tempStep) { code |= 4; diff -= tempStep; }
-        tempStep >>= 1;
-        if (diff >= tempStep) { code |= 2; diff -= tempStep; }
-        tempStep >>= 1;
-        if (diff >= tempStep) { code |= 1; }
-
-        int delta = step >> 3;
-        if ((code & 1) != 0) delta += step >> 2;
-        if ((code & 2) != 0) delta += step >> 1;
-        if ((code & 4) != 0) delta += step;
-        if ((code & 8) != 0) delta = -delta;
-
-        predVal = (predVal + delta).clamp(-32768, 32767);
-        index = (index + _indexTable[code]).clamp(0, 88);
-        step = _stepTable[index];
-
-        // Pack two 4-bit codes into one byte
-        if (!hasHigh) {
-          nibblePair = code & 0x0F;
-          hasHigh = true;
-        } else {
-          nibblePair |= (code & 0x0F) << 4;
-          out.add(nibblePair);
-          nibblePair = 0;
-          hasHigh = false;
-        }
-      }
-      // If there's an odd leftover nibble
-      if (hasHigh) {
-        out.add(nibblePair);
-      }
-      // Pad block up to blockAlign
-      while (out.length % blockAlign != 0) {
-        out.add(0);
-      }
-      offset += (blockAlign - 4) * 2;
-    }
-    return Uint8List.fromList(out);
-  }
+  // _encodePcmToAdpcm removed - no longer compressing outgoing audio
 
   List<int> _uint16le(int v) => [v & 0xFF, (v >> 8) & 0xFF];
   List<int> _uint32le(int v) => [
