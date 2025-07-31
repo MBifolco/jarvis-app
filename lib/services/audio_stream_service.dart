@@ -97,13 +97,16 @@ class AudioStreamService implements BlePeripheralService {
     final mtu = await device.mtu.first;
     final chunkSize = mtu - 3;
 
-    // Simple 4-byte length header
-    final header = ByteData(4)..setUint32(0, pcmData.length, Endian.little);
+    // Add sync pattern (0xAA 0x55) + 4-byte length header for robustness
+    final header = ByteData(6);
+    header.setUint8(0, 0xAA);  // Sync byte 1
+    header.setUint8(1, 0x55);  // Sync byte 2
+    header.setUint32(2, pcmData.length, Endian.little);
     final packet = Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
     
     final startTime = DateTime.now().millisecondsSinceEpoch;
-    debugPrint("📤 BLE START: Sending raw PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 4 header)");
-    debugPrint("📤 Header bytes: [0x${header.getUint8(0).toRadixString(16).padLeft(2, '0')}, 0x${header.getUint8(1).toRadixString(16).padLeft(2, '0')}, 0x${header.getUint8(2).toRadixString(16).padLeft(2, '0')}, 0x${header.getUint8(3).toRadixString(16).padLeft(2, '0')}] = ${pcmData.length} bytes");
+    debugPrint("📤 BLE START: Sending raw PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 6 header)");
+    debugPrint("📤 Sync+Header: [0xAA, 0x55] + length=${pcmData.length} bytes");
 
     int bleChunks = 0;
     for (var offset = 0; offset < packet.length; offset += chunkSize) {
