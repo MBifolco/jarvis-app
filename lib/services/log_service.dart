@@ -1,5 +1,7 @@
 import 'dart:collection';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
 enum LogSource { app, device }
 enum LogLevel { debug, info, warning, error }
@@ -75,6 +77,98 @@ class LogService extends ChangeNotifier {
   void clearLogs() {
     _logs.clear();
     notifyListeners();
+  }
+
+  // Export logs as a string that can be shared
+  String exportLogs() {
+    final buffer = StringBuffer();
+    buffer.writeln('=== Jarvis App Logs ===');
+    buffer.writeln('Exported at: ${DateTime.now().toIso8601String()}');
+    buffer.writeln('Total logs: ${_logs.length}');
+    buffer.writeln('');
+    
+    for (final log in _logs) {
+      final source = log.source == LogSource.app ? 'APP' : 'DEVICE';
+      final level = log.level.toString().split('.').last.toUpperCase();
+      buffer.writeln('[${log.formattedTime}] [$source] [$level] ${log.tag}: ${log.message}');
+    }
+    
+    return buffer.toString();
+  }
+
+  // Save logs to a file in the app's documents directory
+  Future<File?> saveLogsToFile() async {
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').replaceAll('.', '-');
+      final file = File('${directory.path}/jarvis_logs_$timestamp.txt');
+      
+      final logContent = exportLogs();
+      await file.writeAsString(logContent);
+      
+      debugPrint('Logs saved to: ${file.path}');
+      return file;
+    } catch (e) {
+      debugPrint('Failed to save logs: $e');
+      return null;
+    }
+  }
+  
+  // Save logs to Downloads folder (Android only, requires permission)
+  Future<File?> saveLogsToDownloads() async {
+    try {
+      // This only works on Android
+      if (!Platform.isAndroid) {
+        return saveLogsToFile(); // Fall back to app directory
+      }
+      
+      final directory = Directory('/storage/emulated/0/Download');
+      if (!await directory.exists()) {
+        return saveLogsToFile(); // Fall back to app directory
+      }
+      
+      // Create a more readable filename: jarvis_logs_2024-01-30_10-15-30.txt
+      final now = DateTime.now();
+      final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+      final timeStr = '${now.hour.toString().padLeft(2, '0')}-${now.minute.toString().padLeft(2, '0')}-${now.second.toString().padLeft(2, '0')}';
+      final filename = 'jarvis_logs_${dateStr}_$timeStr.txt';
+      final file = File('${directory.path}/$filename');
+      
+      final logContent = exportLogs();
+      await file.writeAsString(logContent);
+      
+      debugPrint('Logs saved to Downloads: ${file.path}');
+      return file;
+    } catch (e) {
+      debugPrint('Failed to save to Downloads: $e');
+      return saveLogsToFile(); // Fall back to app directory
+    }
+  }
+
+  // Get the path where logs are saved
+  Future<String?> getLogDirectory() async {
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      return directory.path;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // List all saved log files
+  Future<List<FileSystemEntity>> getSavedLogFiles() async {
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final logFiles = directory
+          .listSync()
+          .where((file) => file.path.contains('jarvis_logs_') && file.path.endsWith('.txt'))
+          .toList()
+        ..sort((a, b) => b.path.compareTo(a.path)); // Most recent first
+      return logFiles;
+    } catch (e) {
+      debugPrint('Failed to list log files: $e');
+      return [];
+    }
   }
 
   void addLog({

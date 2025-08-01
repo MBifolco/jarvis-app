@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'bt_connection_service.dart';
 import '../models/device_config.dart';
+import '../constants/log_tags.dart';
 
 const String audioNotifyUuid = '99887766-5544-3322-1100-ffeeddccbbaa';
 const String audioWriteUuid  = 'ab907856-3412-de90-ab4f-12cd8b6a5f4e';
@@ -22,6 +23,13 @@ class AudioStreamService implements BlePeripheralService {
   Uint8List? decodedPcmWav;
   Uint8List? _outgoingWav;
   int? expectedLength;
+  
+  // BLE packet statistics
+  int _blePacketCount = 0;
+  int _bleTotalBytes = 0;
+  int _bleMinPacket = 999999;
+  int _bleMaxPacket = 0;
+  DateTime? _bleStartTime;
 
   late final BluetoothConnectionService _connSvc;
   final DeviceConfig config;
@@ -32,7 +40,7 @@ class AudioStreamService implements BlePeripheralService {
     for (var svc in svcs) {
       for (var chr in svc.characteristics) {
         final id = chr.uuid.toString().toLowerCase();
-        debugPrint("🔌 Characteristic: $id");
+        debugPrint("${LogTags.bleDisc} 🔌 Characteristic: $id");
         if (id == audioNotifyUuid &&
             (chr.properties.notify || chr.properties.indicate)) {
           await chr.setNotifyValue(true);
@@ -50,22 +58,41 @@ class AudioStreamService implements BlePeripheralService {
   }
 
   void _handleChunk(List<int> bytes) {
-    debugPrint("Audio buffer length: ${bytes.length}");
+    // Track BLE packet statistics
+    _blePacketCount++;
+    _bleTotalBytes += bytes.length;
+    _bleMinPacket = min(_bleMinPacket, bytes.length);
+    _bleMaxPacket = max(_bleMaxPacket, bytes.length);
+    _bleStartTime ??= DateTime.now();
+    
+    // Log every 50 packets or if unusual size
+    if (_blePacketCount % 50 == 0 || bytes.length < 20 || bytes.length > 500) {
+      final elapsed = DateTime.now().difference(_bleStartTime!).inMilliseconds;
+      final avgPacket = (_bleTotalBytes / _blePacketCount).round();
+      debugPrint("${LogTags.audioRx} 📊 BLE: ${_blePacketCount} packets, ${_bleTotalBytes} bytes, "
+                 "avg/min/max: $avgPacket/$_bleMinPacket/$_bleMaxPacket, ${elapsed}ms");
+    }
+    
     audioBuffer.addAll(bytes);
     if (expectedLength == null && audioBuffer.length >= 46) {
       final header = Uint8List.fromList(audioBuffer.sublist(42, 46));
       expectedLength = 46 + ByteData.sublistView(header).getUint32(0, Endian.little);
-      debugPrint("📦 Expected total length: $expectedLength bytes");
+      debugPrint("${LogTags.audioRx} 📦 Expected total length: $expectedLength bytes");
     }
     onData?.call();
 
     if (expectedLength != null && audioBuffer.length >= expectedLength!) {
-      debugPrint("🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
+      // Log final BLE statistics
+      final elapsed = DateTime.now().difference(_bleStartTime!).inMilliseconds;
+      final throughput = (_bleTotalBytes * 1000 / elapsed).round();
+      debugPrint("${LogTags.audioRx} 📊 BLE Complete: ${_blePacketCount} packets, ${_bleTotalBytes} bytes in ${elapsed}ms (${throughput} bytes/sec)");
+      debugPrint("${LogTags.audioRx} 🎵 Processing complete audio buffer (${audioBuffer.length} bytes)");
+      
       final adpcmBody = Uint8List.fromList(audioBuffer.sublist(46, expectedLength));
       final pcm = decodeAdpcmToPcm(adpcmBody);
       decodedPcmWav = _buildPcmWav(pcm);
       _outgoingWav = decodedPcmWav;
-      debugPrint("🎵 Built WAV file: ${decodedPcmWav!.length} bytes");
+      debugPrint("${LogTags.audioRx} 🎵 Built WAV file: ${decodedPcmWav!.length} bytes");
       _inspectRoundTrip();
       onDone?.call();
       reset();
@@ -89,7 +116,7 @@ class AudioStreamService implements BlePeripheralService {
       if (e != 0) diffs++;
       if (e > maxErr) maxErr = e;
     }
-    debugPrint('🔍 Round-trip compare: $sampleCount samples; differences: $diffs; max sample-error: $maxErr');
+    debugPrint('${LogTags.audioRx} 🔍 Round-trip compare: $sampleCount samples; differences: $diffs; max sample-error: $maxErr');
   }
 
   Future<void> sendPcmToDevice(Uint8List pcmData) async {
@@ -105,8 +132,8 @@ class AudioStreamService implements BlePeripheralService {
     final packet = Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
     
     final startTime = DateTime.now().millisecondsSinceEpoch;
-    debugPrint("📤 BLE START: Sending raw PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 6 header)");
-    debugPrint("📤 Sync+Header: [0xAA, 0x55] + length=${pcmData.length} bytes");
+    debugPrint("${LogTags.audioTx} 📤 BLE START: Sending raw PCM audio: ${packet.length} bytes (${pcmData.length} PCM + 6 header)");
+    debugPrint("${LogTags.audioTx} 📤 Sync+Header: [0xAA, 0x55] + length=${pcmData.length} bytes");
 
     int bleChunks = 0;
     for (var offset = 0; offset < packet.length; offset += chunkSize) {
@@ -115,7 +142,7 @@ class AudioStreamService implements BlePeripheralService {
       
       // Log exactly what we're sending to BLE for first few chunks
       if (offset == 0 || offset == chunkSize) {
-        debugPrint("📤 BLE chunk at offset $offset: ${chunk.take(min(12, chunk.length)).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}${chunk.length > 12 ? '...' : ''}");
+        debugPrint("${LogTags.audioTx} 📤 BLE chunk at offset $offset: ${chunk.take(min(12, chunk.length)).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}${chunk.length > 12 ? '...' : ''}");
       }
       
       await _writeChr!.write(chunk, withoutResponse: true);
@@ -123,8 +150,8 @@ class AudioStreamService implements BlePeripheralService {
     }
     
     final endTime = DateTime.now().millisecondsSinceEpoch;
-    debugPrint("📤 BLE COMPLETE: Sent $bleChunks BLE chunks in ${endTime - startTime}ms");
-    debugPrint("📤 Complete packet header: ${packet.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')} (first 8 bytes)");
+    debugPrint("${LogTags.audioTx} 📤 BLE COMPLETE: Sent $bleChunks BLE chunks in ${endTime - startTime}ms");
+    debugPrint("${LogTags.audioTx} 📤 Complete packet header: ${packet.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')} (first 8 bytes)");
   }
 
   Future<void> sendWavToDevice(Uint8List wav) async {
@@ -143,6 +170,13 @@ class AudioStreamService implements BlePeripheralService {
     expectedLength = null;
     decodedPcmWav = null;
     onData?.call();
+    
+    // Reset BLE statistics
+    _blePacketCount = 0;
+    _bleTotalBytes = 0;
+    _bleMinPacket = 999999;
+    _bleMaxPacket = 0;
+    _bleStartTime = null;
   }
 
   void dispose() {

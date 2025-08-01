@@ -114,6 +114,75 @@ class _LogViewerState extends State<LogViewer> {
             tooltip: _autoScroll ? 'Auto-scroll ON' : 'Auto-scroll OFF',
           ),
           
+          // Save logs to Downloads (Android)
+          IconButton(
+            icon: const Icon(Icons.download),
+            onPressed: () async {
+              final file = await logService.saveLogsToDownloads();
+              if (context.mounted) {
+                final isDownloads = file?.path.contains('/Download') ?? false;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(file != null 
+                        ? isDownloads 
+                            ? 'Logs saved to Downloads folder' 
+                            : 'Logs saved to app documents'
+                        : 'Failed to save logs'),
+                    duration: const Duration(seconds: 3),
+                    action: file != null && isDownloads ? SnackBarAction(
+                      label: 'View',
+                      onPressed: () {
+                        showDialog(
+                          context: context,
+                          builder: (context) => AlertDialog(
+                            title: const Text('Log File Saved'),
+                            content: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('File saved to Downloads folder:'),
+                                const SizedBox(height: 8),
+                                SelectableText(
+                                  file.path.split('/').last,
+                                  style: const TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                              ],
+                            ),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context),
+                                child: const Text('OK'),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ) : null,
+                  ),
+                );
+              }
+            },
+            tooltip: 'Save to Downloads',
+          ),
+          
+          // Export/Share logs
+          IconButton(
+            icon: const Icon(Icons.share),
+            onPressed: () async {
+              final logs = logService.exportLogs();
+              await Clipboard.setData(ClipboardData(text: logs));
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('All logs copied to clipboard'),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+              }
+            },
+            tooltip: 'Copy all logs',
+          ),
+          
           // Clear logs
           IconButton(
             icon: const Icon(Icons.clear_all),

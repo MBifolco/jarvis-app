@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:openai_realtime_dart/openai_realtime_dart.dart';
 import 'audio_player_service.dart';
 import 'transcript_service.dart';
+import '../constants/log_tags.dart';
 
 class RealtimeService {
   final RealtimeClient _client;
@@ -24,6 +25,12 @@ class RealtimeService {
   bool _responseInProgress = false;
   bool _forceFlushing = false;  // Track if we're in force flush mode
   Timer? _responseTimeoutTimer;
+  
+  // Audio streaming statistics
+  int _audioChunkCount = 0;
+  int _audioTotalBytes = 0;
+  DateTime? _audioStreamStart;
+  double _lastLoggedBufferSeconds = 0;
 
   RealtimeService(
     String apiKey, {
@@ -34,7 +41,7 @@ class RealtimeService {
     _player = AudioPlayerService();
 
   Future<void> init() async {
-    debugPrint('🚀 [RealtimeService] init()');
+    debugPrint('${LogTags.realtime} 🚀 init()');
     
     // Reset connection state
     _connected = false;
@@ -54,10 +61,10 @@ class RealtimeService {
     );
     _client.on(RealtimeEventType.error, (evt) {
       final error = (evt as RealtimeEventError).error;
-      debugPrint('❌ Realtime API error: $error');
-      debugPrint('❌ Error details: ${error.message}');
+      debugPrint('${LogTags.realtime} ❌ Realtime API error: $error');
+      debugPrint('${LogTags.realtime} ❌ Error details: ${error.message}');
       if (error.code != null) {
-        debugPrint('❌ Error code: ${error.code}');
+        debugPrint('${LogTags.realtime} ❌ Error code: ${error.code}');
       }
       
       // Reset state on error
@@ -67,7 +74,7 @@ class RealtimeService {
       
       // Clear any pending audio buffer
       if (_audioBuffer.isNotEmpty) {
-        debugPrint('❌ Clearing ${_audioBuffer.length} bytes from buffer due to error');
+        debugPrint('${LogTags.realtime} ❌ Clearing ${_audioBuffer.length} bytes from buffer due to error');
         _audioBuffer.clear();
       }
     });
@@ -76,7 +83,7 @@ class RealtimeService {
       final transcript = event.result.delta?.transcript;
       final audioData = event.result.delta?.audio;
       
-      debugPrint('🗣 partial transcript: "${transcript ?? ''}"');
+      debugPrint('${LogTags.realtime} 🗣 partial transcript: "${transcript ?? ''}"');
       
       // Update transcript with partial response
       if (transcript != null && transcript.isNotEmpty && transcriptService != null) {
@@ -87,19 +94,31 @@ class RealtimeService {
       if (audioData != null && audioData.isNotEmpty) {
         _responseInProgress = true;  // Mark that we're receiving audio
         
+        // Initialize streaming statistics
+        _audioStreamStart ??= DateTime.now();
+        
         // Cancel timeout timer since we're receiving a response
         if (_responseTimeoutTimer != null && _responseTimeoutTimer!.isActive) {
-          debugPrint('⏰ Cancelling timeout timer - response received');
+          debugPrint('${LogTags.realtime} ⏰ Cancelling timeout timer - response received');
           _responseTimeoutTimer!.cancel();
         }
         
         final pcmBytes = audioData.cast<int>();
-        final beforeSize = _audioBuffer.length;
         _audioBuffer.addAll(pcmBytes);
-        final afterSize = _audioBuffer.length;
-        final bufferSeconds = afterSize / 48000.0; // 48KB per second
-        final timestamp = DateTime.now().millisecondsSinceEpoch;
-        debugPrint('📥 accumulated ${pcmBytes.length} bytes: ${beforeSize} → ${afterSize} (${bufferSeconds.toStringAsFixed(1)}s buffered) at $timestamp');
+        
+        // Update statistics
+        _audioChunkCount++;
+        _audioTotalBytes += pcmBytes.length;
+        final bufferSeconds = _audioBuffer.length / 48000.0; // 48KB per second
+        
+        // Log every 10 chunks or when buffer reaches send threshold
+        if (_audioChunkCount % 10 == 0 || _audioBuffer.length >= _minChunkSize) {
+          final elapsed = DateTime.now().difference(_audioStreamStart!).inMilliseconds;
+          final throughput = elapsed > 0 ? (_audioTotalBytes * 1000 / elapsed).round() : 0;
+          debugPrint('${LogTags.realtime} 📥 Audio stream: $_audioChunkCount chunks, $_audioTotalBytes bytes '
+                     '(${bufferSeconds.toStringAsFixed(1)}s buffered) @ $throughput bytes/sec');
+          _lastLoggedBufferSeconds = bufferSeconds;
+        }
         
         // Send chunk when we have enough data (1+ seconds)
         if (_audioBuffer.length >= _minChunkSize) {
@@ -111,9 +130,16 @@ class RealtimeService {
     _client.on(RealtimeEventType.conversationItemCompleted, (evt) async {
       final wrapper = (evt as RealtimeEventConversationItemCompleted).item;
       final transcript = wrapper.formatted?.transcript ?? '';
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      debugPrint('✅ completed response at $timestamp: "$transcript"');
-      debugPrint('✅ Audio buffer at completion: ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s)');
+      
+      // Log final streaming statistics
+      if (_audioStreamStart != null && _audioChunkCount > 0) {
+        final elapsed = DateTime.now().difference(_audioStreamStart!).inMilliseconds;
+        final throughput = elapsed > 0 ? (_audioTotalBytes * 1000 / elapsed).round() : 0;
+        debugPrint('${LogTags.realtime} ✅ Audio stream complete: $_audioChunkCount chunks, $_audioTotalBytes bytes '
+                   'in ${elapsed}ms @ $throughput bytes/sec');
+      }
+      debugPrint('${LogTags.realtime} ✅ Response: "$transcript"');
+      debugPrint('${LogTags.realtime} ✅ Audio buffer at completion: ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s)');
       
       // Finalize transcript with completed response
       if (transcript.isNotEmpty && transcriptService != null) {
@@ -122,18 +148,18 @@ class RealtimeService {
       
       // Force flush any remaining audio buffer, even if transmitting
       if (_audioBuffer.isNotEmpty || _responseInProgress) {
-        debugPrint('✅ Triggering force flush for completion (responseInProgress=$_responseInProgress)');
+        debugPrint('${LogTags.realtime} ✅ Triggering force flush for completion (responseInProgress=$_responseInProgress)');
         // Add a small delay to ensure all streaming data has been accumulated
         await Future.delayed(Duration(milliseconds: 200));
         
         if (_audioBuffer.isNotEmpty) {
-          debugPrint('✅ Force flushing ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s)');
+          debugPrint('${LogTags.realtime} ✅ Force flushing ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s)');
           await _forceFlushAudioBuffer();
         }
         
         // Add delay after force flush to ensure device has time to play final chunk
         await Future.delayed(Duration(milliseconds: 500));
-        debugPrint('✅ Force flush complete, final chunk should be playing');
+        debugPrint('${LogTags.realtime} ✅ Force flush complete, final chunk should be playing');
       }
       
       _responseInProgress = false;  // Reset for next response
@@ -141,21 +167,21 @@ class RealtimeService {
 
     // Add session created event handler to confirm connection
     _client.on(RealtimeEventType.sessionCreated, (evt) {
-      debugPrint('✅ Session created successfully');
+      debugPrint('${LogTags.realtime} ✅ Session created successfully');
       final session = (evt as RealtimeEventSessionCreated).session;
-      debugPrint('✅ Session ID: ${session.id}');
-      debugPrint('✅ Model: ${session.model}');
+      debugPrint('${LogTags.realtime} ✅ Session ID: ${session.id}');
+      debugPrint('${LogTags.realtime} ✅ Model: ${session.model}');
       _connected = true;  // Mark as truly connected only after session is created
     });
     
     // Add session updated event handler
     _client.on(RealtimeEventType.sessionUpdated, (evt) {
-      debugPrint('🔄 Session updated');
+      debugPrint('${LogTags.realtime} 🔄 Session updated');
     });
     
     // Monitor for disconnection or connection issues
     _client.on(RealtimeEventType.close, (evt) {
-      debugPrint('⚠️ WebSocket connection closed');
+      debugPrint('${LogTags.realtime} ⚠️ WebSocket connection closed');
       _connected = false;
       // Cancel any pending operations
       _responseTimeoutTimer?.cancel();
@@ -164,13 +190,13 @@ class RealtimeService {
       _forceFlushing = false;
     });
     
-    debugPrint('🌐 connecting RealtimeClient…');
+    debugPrint('${LogTags.realtime} 🌐 connecting RealtimeClient…');
     try {
       await _client.connect();
       _connected = true;
-      debugPrint('🔗 connected');
+      debugPrint('${LogTags.realtime} 🔗 connected');
     } catch (e) {
-      debugPrint('❌ Failed to connect to RealtimeClient: $e');
+      debugPrint('${LogTags.realtime} ❌ Failed to connect to RealtimeClient: $e');
       _connected = false;
       throw e;
     }
@@ -178,16 +204,16 @@ class RealtimeService {
 
   Future<void> sendAudio(Uint8List wavBytes, {String? userTranscript}) async {
     if (!_connected) {
-      debugPrint('⚠️ RealtimeService not connected, attempting to reconnect...');
+      debugPrint('${LogTags.realtime} ⚠️ RealtimeService not connected, attempting to reconnect...');
       try {
         await init();
       } catch (e) {
-        debugPrint('❌ Failed to reconnect: $e');
+        debugPrint('${LogTags.realtime} ❌ Failed to reconnect: $e');
         throw StateError('RealtimeService not initialized and reconnection failed');
       }
     }
     
-    debugPrint('🎤 NEW USER REQUEST - buffer before cleanup: ${_audioBuffer.length} bytes');
+    debugPrint('${LogTags.realtime} 🎤 NEW USER REQUEST - buffer before cleanup: ${_audioBuffer.length} bytes');
     
     // Clean up any remaining audio from previous response
     await _cleanupPreviousResponse();
@@ -202,7 +228,7 @@ class RealtimeService {
     
     // Set a timeout for the response (30 seconds - increased from 15)
     _responseTimeoutTimer = Timer(const Duration(seconds: 30), () {
-      debugPrint('⏰ Response timeout! No response received within 30 seconds');
+      debugPrint('${LogTags.realtime} ⏰ Response timeout! No response received within 30 seconds');
       
       // Reset state
       _responseInProgress = false;
@@ -211,7 +237,7 @@ class RealtimeService {
       
       // Clear any pending audio buffer
       if (_audioBuffer.isNotEmpty) {
-        debugPrint('⏰ Clearing ${_audioBuffer.length} bytes from buffer due to timeout');
+        debugPrint('${LogTags.realtime} ⏰ Clearing ${_audioBuffer.length} bytes from buffer due to timeout');
         _audioBuffer.clear();
       }
       
@@ -223,20 +249,20 @@ class RealtimeService {
     });
     
     final b64 = base64Encode(wavBytes);
-    debugPrint('🎵 sendAudio: rawBytes=${wavBytes.length}, b64Chars=${b64.length}');
-    debugPrint('🎵 Connection state: connected=$_connected');
+    debugPrint('${LogTags.realtime} 🎵 sendAudio: rawBytes=${wavBytes.length}, b64Chars=${b64.length}');
+    debugPrint('${LogTags.realtime} 🎵 Connection state: connected=$_connected');
     
     try {
-      debugPrint('🎵 Sending audio to OpenAI...');
+      debugPrint('${LogTags.realtime} 🎵 Sending audio to OpenAI...');
       await _client.sendUserMessageContent([
         ContentPart.inputAudio(audio: b64),
       ]);
-      debugPrint('🎵 Audio sent successfully, waiting for response...');
+      debugPrint('${LogTags.realtime} 🎵 Audio sent successfully, waiting for response...');
     } catch (e) {
-      debugPrint('❌ Error sending audio to OpenAI: $e');
-      debugPrint('❌ Error type: ${e.runtimeType}');
+      debugPrint('${LogTags.realtime} ❌ Error sending audio to OpenAI: $e');
+      debugPrint('${LogTags.realtime} ❌ Error type: ${e.runtimeType}');
       if (e is Exception) {
-        debugPrint('❌ Exception details: ${e.toString()}');
+        debugPrint('${LogTags.realtime} ❌ Exception details: ${e.toString()}');
       }
       _responseTimeoutTimer?.cancel();
       rethrow;
@@ -246,7 +272,7 @@ class RealtimeService {
   Future<void> _cleanupPreviousResponse() async {
     // Force flush any remaining audio from previous response
     if (_audioBuffer.isNotEmpty) {
-      debugPrint('🧹 cleaning up ${_audioBuffer.length} bytes from previous response');
+      debugPrint('${LogTags.realtime} 🧹 cleaning up ${_audioBuffer.length} bytes from previous response');
       await _forceFlushAudioBuffer();
       // Extra delay to ensure last chunk plays
       await Future.delayed(Duration(milliseconds: 500));
@@ -256,11 +282,18 @@ class RealtimeService {
     _responseInProgress = false;
     _forceFlushing = false;
     _chunkCounter = 0;
-    debugPrint('🧹 cleanup complete, ready for new response');
+    
+    // Reset audio streaming statistics
+    _audioChunkCount = 0;
+    _audioTotalBytes = 0;
+    _audioStreamStart = null;
+    _lastLoggedBufferSeconds = 0;
+    
+    debugPrint('${LogTags.realtime} 🧹 cleanup complete, ready for new response');
   }
 
   Future<void> dispose() async {
-    debugPrint('🛑 disposing RealtimeService');
+    debugPrint('${LogTags.realtime} 🛑 disposing RealtimeService');
     
     // Cancel any active timers
     _responseTimeoutTimer?.cancel();
@@ -273,7 +306,7 @@ class RealtimeService {
     
     // Clear any pending audio buffer
     if (_audioBuffer.isNotEmpty) {
-      debugPrint('🛑 Clearing ${_audioBuffer.length} bytes from buffer on dispose');
+      debugPrint('${LogTags.realtime} 🛑 Clearing ${_audioBuffer.length} bytes from buffer on dispose');
       _audioBuffer.clear();
     }
     
@@ -281,9 +314,9 @@ class RealtimeService {
     
     try {
       await _client.disconnect();
-      debugPrint('🛑 RealtimeClient disconnected');
+      debugPrint('${LogTags.realtime} 🛑 RealtimeClient disconnected');
     } catch (e) {
-      debugPrint('❌ Error disconnecting RealtimeClient: $e');
+      debugPrint('${LogTags.realtime} ❌ Error disconnecting RealtimeClient: $e');
     }
   }
 
@@ -291,7 +324,7 @@ class RealtimeService {
     if (_audioBuffer.isEmpty) return;
     
     if (_transmitting) {
-      debugPrint('⏳ Flush blocked - already transmitting (buffer: ${_audioBuffer.length} bytes = ${(_audioBuffer.length / 48000.0).toStringAsFixed(1)}s)');
+      debugPrint('${LogTags.realtime} ⏳ Flush blocked - already transmitting (buffer: ${_audioBuffer.length} bytes = ${(_audioBuffer.length / 48000.0).toStringAsFixed(1)}s)');
       return;
     }
     
@@ -301,7 +334,7 @@ class RealtimeService {
   Future<void> _forceFlushAudioBuffer() async {
     if (_audioBuffer.isEmpty) return;
     
-    debugPrint('🔥 FORCE FLUSH CALLED: ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s) buffered');
+    debugPrint('${LogTags.realtime} 🔥 FORCE FLUSH CALLED: ${_audioBuffer.length} bytes (${(_audioBuffer.length / 48000.0).toStringAsFixed(2)}s) buffered');
     
     _forceFlushing = true;  // Enter force flush mode
     
@@ -311,7 +344,7 @@ class RealtimeService {
       await Future.delayed(Duration(milliseconds: 50));
       waitCount++;
       if (waitCount % 10 == 0) {
-        debugPrint('🔥 Still waiting for transmission to finish... (${waitCount * 50}ms)');
+        debugPrint('${LogTags.realtime} 🔥 Still waiting for transmission to finish... (${waitCount * 50}ms)');
       }
     }
     
@@ -320,12 +353,12 @@ class RealtimeService {
       // Only flush if we have at least some meaningful audio data
       // Ensure we have an even number of bytes for 16-bit samples
       if (_audioBuffer.length >= 2 && _audioBuffer.length % 2 == 0) {
-        debugPrint('🔥 FORCE FLUSHING ${_audioBuffer.length} bytes');
+        debugPrint('${LogTags.realtime} 🔥 FORCE FLUSHING ${_audioBuffer.length} bytes');
         await _doFlushAudioBuffer();
         // Small delay between chunks during force flush
         await Future.delayed(Duration(milliseconds: 50));
       } else {
-        debugPrint('🚫 Skipping flush of incomplete audio data: ${_audioBuffer.length} bytes');
+        debugPrint('${LogTags.realtime} 🚫 Skipping flush of incomplete audio data: ${_audioBuffer.length} bytes');
         _audioBuffer.clear();
         break;
       }
@@ -346,9 +379,9 @@ class RealtimeService {
     
     final bufferSeconds = _audioBuffer.length / 48000.0;
     final chunkSeconds = pcmData.length / 48000.0;
-    debugPrint('🎵 CHUNK $_chunkCounter: START sending ${isFinalChunk ? "FINAL" : ""} at timestamp $timestamp: ${pcmData.length} bytes (${chunkSeconds.toStringAsFixed(1)}s) from buffer of ${_audioBuffer.length} bytes (${bufferSeconds.toStringAsFixed(1)}s)');
-    debugPrint('🎵 CHUNK $_chunkCounter: PCM first 8 bytes: ${pcmData.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
-    debugPrint('🎵 CHUNK $_chunkCounter: PCM last 8 bytes: ${pcmData.skip(pcmData.length - 8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
+    debugPrint('${LogTags.realtime} 🎵 CHUNK $_chunkCounter: START sending ${isFinalChunk ? "FINAL" : ""} at timestamp $timestamp: ${pcmData.length} bytes (${chunkSeconds.toStringAsFixed(1)}s) from buffer of ${_audioBuffer.length} bytes (${bufferSeconds.toStringAsFixed(1)}s)');
+    debugPrint('${LogTags.realtime} 🎵 CHUNK $_chunkCounter: PCM first 8 bytes: ${pcmData.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
+    debugPrint('${LogTags.realtime} 🎵 CHUNK $_chunkCounter: PCM last 8 bytes: ${pcmData.skip(pcmData.length - 8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
     
     if (onAudio != null) {
       onAudio!(pcmData);
@@ -356,12 +389,12 @@ class RealtimeService {
       // Add a small delay to ensure BLE transmission completes
       await Future.delayed(Duration(milliseconds: 100));
       final endTimestamp = DateTime.now().millisecondsSinceEpoch;
-      debugPrint('🎵 CHUNK $_chunkCounter: FINISHED sending at timestamp $endTimestamp (took ${endTimestamp - timestamp}ms)');
+      debugPrint('${LogTags.realtime} 🎵 CHUNK $_chunkCounter: FINISHED sending at timestamp $endTimestamp (took ${endTimestamp - timestamp}ms)');
     } else {
       // For phone playback, we still need WAV format
       final wav = _buildPcmWav(pcmData.cast<int>().toList());
       _player.playBuffer(wav, onFinished: () {
-        debugPrint('🔈 TTS buffer playback finished');
+        debugPrint('${LogTags.audioPlay} 🔈 TTS buffer playback finished');
       });
     }
     
@@ -372,22 +405,22 @@ class RealtimeService {
     // This prevents header corruption from concurrent packets
     // With 48KB chunks (1 second of audio), transmission is faster (~300ms)
     // Device needs ~85ms to process, so 400ms total should be safe
-    debugPrint('🎵 CHUNK $_chunkCounter: Starting 400ms delay before next chunk...');
+    debugPrint('${LogTags.realtime} 🎵 CHUNK $_chunkCounter: Starting 400ms delay before next chunk...');
     await Future.delayed(Duration(milliseconds: 400));
     
     final readyTimestamp = DateTime.now().millisecondsSinceEpoch;
-    debugPrint('🎵 CHUNK $_chunkCounter: READY for next chunk at timestamp $readyTimestamp');
+    debugPrint('${LogTags.realtime} 🎵 CHUNK $_chunkCounter: READY for next chunk at timestamp $readyTimestamp');
     _transmitting = false;
     
     // Check if we need to send more chunks
     if (_forceFlushing && _audioBuffer.length > 0) {
       // During force flush, send ANY remaining data
       final remainingSeconds = _audioBuffer.length / 48000.0;
-      debugPrint('🔥 Force flush mode - will send remaining ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s)');
+      debugPrint('${LogTags.realtime} 🔥 Force flush mode - will send remaining ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s)');
       // Don't schedule, the force flush loop will handle it
     } else if (_audioBuffer.length >= _minChunkSize) {
       final remainingSeconds = _audioBuffer.length / 48000.0;
-      debugPrint('🎵 Buffer still has ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s) - scheduling next chunk');
+      debugPrint('${LogTags.realtime} 🎵 Buffer still has ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s) - scheduling next chunk');
       // Schedule next chunk with a small delay to avoid BLE corruption
       Future.delayed(Duration(milliseconds: 50), () {
         if (_audioBuffer.length >= _minChunkSize && !_transmitting) {
@@ -396,7 +429,7 @@ class RealtimeService {
       });
     } else if (_audioBuffer.length > 0) {
       final remainingSeconds = _audioBuffer.length / 48000.0;
-      debugPrint('🎵 Buffer has ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s) remaining - waiting for more data');
+      debugPrint('${LogTags.realtime} 🎵 Buffer has ${_audioBuffer.length} bytes (${remainingSeconds.toStringAsFixed(1)}s) remaining - waiting for more data');
     }
   }
 
@@ -409,7 +442,7 @@ class RealtimeService {
     
     // Ensure we have valid audio data (even number of bytes for 16-bit samples)
     if (rawBytes.length < 2 || rawBytes.length % 2 != 0) {
-      debugPrint('⚠️ Invalid audio data length: ${rawBytes.length} bytes');
+      debugPrint('${LogTags.realtime} ⚠️ Invalid audio data length: ${rawBytes.length} bytes');
       // Pad with a zero byte if odd length
       if (rawBytes.length % 2 != 0) {
         rawBytes.add(0);
@@ -428,7 +461,7 @@ class RealtimeService {
       samples.add(signed);
     }
     
-    debugPrint('🎵 Built WAV: ${rawBytes.length} bytes → ${samples.length} samples');
+    debugPrint('${LogTags.realtime} 🎵 Built WAV: ${rawBytes.length} bytes → ${samples.length} samples');
     
     final dataSize = samples.length * 2;  // 2 bytes per 16-bit sample
     final fileSize = 44 + dataSize;
