@@ -45,7 +45,7 @@ class RealtimeService {
     
     await _player.init();
     await _client.updateSession(
-      voice: Voice.alloy,
+      voice: Voice.shimmer,
       turnDetection: TurnDetection(
         type: TurnDetectionType.serverVad,
         threshold: 0.8,

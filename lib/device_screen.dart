@@ -13,6 +13,8 @@ import 'services/transcript_service.dart';
 import 'services/whisper_service.dart';
 import 'widgets/transcript_widget.dart';
 import '../models/device_config.dart';
+import 'widgets/log_viewer.dart';
+import 'services/log_service.dart';
 
 class DeviceScreen extends StatefulWidget {
   final BluetoothDevice device;
@@ -190,7 +192,21 @@ class _DeviceScreenState extends State<DeviceScreen> {
             : '✅ Buffered $total bytes';
 
     return Scaffold(
-      appBar: AppBar(title: Text(widget.device.platformName)),
+      appBar: AppBar(
+        title: Text(widget.device.platformName),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.article),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const LogViewer()),
+              );
+            },
+            tooltip: 'View Logs',
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(

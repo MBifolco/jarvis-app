@@ -8,9 +8,11 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'device_screen.dart';
+import 'services/log_service.dart';
 
 Future<void> main() async {
   await dotenv.load(fileName: "p.env");
+  initializeLogging();  // Initialize the logging system
   runApp(const MyApp());
 }
 
