@@ -337,19 +337,25 @@ class RealtimeService {
   Future<void> _doFlushAudioBuffer() async {
     _transmitting = true;
     _chunkCounter++;
-    
+
+    // Add 1-second delay before first chunk to let device complete its transmission
+    if (_chunkCounter == 1) {
+      debugPrint('⏰ First chunk - adding 1s delay for device to finish transmission');
+      await Future.delayed(Duration(milliseconds: 1000));
+    }
+
     // Extract exactly _minChunkSize bytes (or all if less)
     final bytesToSend = _audioBuffer.length >= _minChunkSize ? _minChunkSize : _audioBuffer.length;
     final pcmData = Uint8List.fromList(_audioBuffer.take(bytesToSend).toList());
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final isFinalChunk = bytesToSend < _minChunkSize;  // This is a partial final chunk
-    
+
     final bufferSeconds = _audioBuffer.length / 48000.0;
     final chunkSeconds = pcmData.length / 48000.0;
     debugPrint('🎵 CHUNK $_chunkCounter: START sending ${isFinalChunk ? "FINAL" : ""} at timestamp $timestamp: ${pcmData.length} bytes (${chunkSeconds.toStringAsFixed(1)}s) from buffer of ${_audioBuffer.length} bytes (${bufferSeconds.toStringAsFixed(1)}s)');
     debugPrint('🎵 CHUNK $_chunkCounter: PCM first 8 bytes: ${pcmData.take(8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
     debugPrint('🎵 CHUNK $_chunkCounter: PCM last 8 bytes: ${pcmData.skip(pcmData.length - 8).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}');
-    
+
     if (onAudio != null) {
       onAudio!(pcmData);
       // Note: onAudio is synchronous but it triggers async BLE operations
